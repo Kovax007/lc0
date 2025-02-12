@@ -172,6 +172,8 @@ class Edge {
   // Creates array of edges from the list of moves.
   static std::unique_ptr<Edge[]> FromMovelist(const MoveList& moves);
 
+  bool GetCheck() const;
+
   // Returns move from the point of view of the player making it (if as_opponent
   // is false) or as opponent (if as_opponent is true).
   Move GetMove(bool as_opponent = false) const;
@@ -813,6 +815,8 @@ class EdgeAndNode {
   Move GetMove(bool flip = false) const {
     return edge_ ? edge_->GetMove(flip) : Move();
   }
+  bool GetCheck() const { return edge_->GetCheck(); }
+
 
   // Returns U = numerator * p / N.
   // Passed numerator is expected to be equal to (cpuct * sqrt(N[parent])).

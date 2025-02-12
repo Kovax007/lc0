@@ -601,7 +601,8 @@ std::vector<std::string> Search::GetVerboseStats(Node* node) const {
   auto print = [](auto* oss, auto pre, auto v, auto post, auto w, int p = 0) {
     *oss << pre << std::setw(w) << std::setprecision(p) << v << post;
   };
-  auto print_head = [&](auto* oss, auto label, int i, auto n, auto f, auto p) {
+  auto print_head = [&](auto* oss, auto label, int i, auto n, auto f, auto p,
+                        auto c) {
     *oss << std::fixed;
     print(oss, "", label, " ", 5);
     print(oss, "(", i, ") ", 4);
@@ -609,6 +610,7 @@ std::vector<std::string> Search::GetVerboseStats(Node* node) const {
     print(oss, "N: ", n, " ", 7);
     print(oss, "(+", f, ") ", 2);
     print(oss, "(P: ", p * 100, "%) ", 5, p >= 0.99995f ? 1 : 2);
+    print(oss, "C: ", c, " ", 4);
   };
   auto print_stats = [&](auto* oss, const auto* n) {
     const auto sign = n == node ? -1 : 1;
@@ -683,7 +685,7 @@ std::vector<std::string> Search::GetVerboseStats(Node* node) const {
     // TODO: should this be displaying transformed index?
     print_head(&oss, edge.GetMove(is_black_to_move).as_string(),
                edge.GetMove().as_nn_index(0), edge.GetN(), edge.GetNInFlight(),
-               edge.GetP());
+               edge.GetP(), edge.GetCheck());
     print_stats(&oss, edge.node());
     print(&oss, "(U: ", edge.GetU(U_coeff), ") ", 6, 5);
     print(&oss, "(S: ", Q + edge.GetU(U_coeff) + M, ") ", 8, 5);
@@ -694,7 +696,7 @@ std::vector<std::string> Search::GetVerboseStats(Node* node) const {
   // Include stats about the node in similar format to its children above.
   std::ostringstream oss;
   print_head(&oss, "node ", node->GetNumEdges(), node->GetN(),
-             node->GetNInFlight(), node->GetVisitedPolicy());
+             node->GetNInFlight(), node->GetVisitedPolicy(), false);
   print_stats(&oss, node);
   print_tail(&oss, node);
 
