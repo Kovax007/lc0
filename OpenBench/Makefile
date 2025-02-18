@@ -11,3 +11,4 @@ ifdef EVALFILE
 else
 	../build.sh && mv ../build/release/lc0 $(EXE)
 endif
+	
