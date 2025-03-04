@@ -269,6 +269,14 @@ const OptionId SearchParams::kCacheHistoryLengthId{
     "this value is less than history that NN uses to eval a position, it's "
     "possble that the search will use eval of the same position with different "
     "history taken from cache."};
+const OptionId SearchParams::kPolicyDecayExponentId{
+    "policy-decay-exponent", "PolicyDecayExponent",
+    "Policy decay exponent. Sets the exponent of the visit based policy decay "
+    "term."};
+const OptionId SearchParams::kPolicyDecayFactorId{
+    "policy-decay-factor", "PolicyDecayFactor",
+    "Policy decay factor. Scales the visit count for the visit based policy "
+    "decay term."};
 const OptionId SearchParams::kPolicySoftmaxTempId{
     "policy-softmax-temp", "PolicyTemperature",
     "Policy softmax temperature. Higher values make priors of move candidates "
@@ -583,6 +591,8 @@ void SearchParams::Populate(OptionsParser* options) {
   options->Add<FloatOption>(kFpuValueAtRootId, -100.0f, 100.0f) = 1.0f;
   options->Add<IntOption>(kCacheHistoryLengthId, 0, 7) = 0;
   options->Add<FloatOption>(kPolicySoftmaxTempId, 0.1f, 10.0f) = 1.359f;
+  options->Add<FloatOption>(kPolicyDecayExponentId, 0.0f, 10.0f) = 0.5f;
+  options->Add<FloatOption>(kPolicyDecayFactorId, 0.0f, 1.0f) = 0.0001f;
   options->Add<IntOption>(kMaxCollisionEventsId, 1, 65536) = 917;
   options->Add<IntOption>(kMaxCollisionVisitsId, 1, 100000000) = 80000;
   options->Add<IntOption>(kMaxCollisionVisitsScalingStartId, 1, 100000) = 28;
@@ -852,6 +862,8 @@ SearchParams::SearchParams(const OptionsDict& options)
       kUseCorrectionHistory(options.Get<bool>(kUseCorrectionHistoryId)),
       kCorrectionHistoryAlpha(options.Get<float>(kCorrectionHistoryAlphaId)),
       kCorrectionHistoryLambda(options.Get<float>(kCorrectionHistoryLambdaId)),
+      kPolicyDecayExponent(options.Get<float>(kPolicyDecayExponentId)),
+      kPolicyDecayFactor(options.Get<float>(kPolicyDecayFactorId)),
 
 
       kEasyEvalWeightDecay(options.Get<float>(kEasyEvalWeightDecayId)),

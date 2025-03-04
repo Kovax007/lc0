@@ -576,6 +576,17 @@ inline float ComputeWeight(const SearchParams& params, float uncertainty) {
   return fmin(cap, coefficient * pow(uncertainty, exponent));
 }
 
+inline float ComputePolicyDecayFactor(const SearchParams& params, uint32_t N) {
+  const float exponent = params.GetPolicyDecayExponent();
+  const float proportionality_factor = params.GetPolicyDecayFactor();
+  return (exponent == 0.0f || proportionality_factor == 0.0f)
+             ? 1.0f
+             : FastExp(-FastLog(1.0f + proportionality_factor * N) * exponent);
+}
+inline float ComputePolicyDecay(const float factor, const float pol) {
+  return factor == 1.0f ? pol : pol / (pol + (1.0f - pol) * factor);
+}
+
 }  // namespace
 
 std::vector<std::string> Search::GetVerboseStats(Node* node) const {
@@ -1858,6 +1869,8 @@ void SearchWorker::PickNodesToExtendTask(
       const float draw_score =
           (full_path.size() % 2 == 0) ? odd_draw_score : even_draw_score;
       m_evaluator.SetParent(node);
+      const float policy_decay_factor =
+          ComputePolicyDecayFactor(params_, node->GetWeight());
       float visited_pol = 0.0f;
       for (Node* child : node->VisitedNodes()) {
         int index = child->Index();
@@ -1937,6 +1950,7 @@ void SearchWorker::PickNodesToExtendTask(
           if (idx > cache_filled_idx) {
             float p = cur_iters[idx].GetP();
 
+            p = ComputePolicyDecay(policy_decay_factor, p);
             // a small hack to reduce policy on bad moves
             if (p < 0.01f) p /= 3;
             //if (cur_iters[idx].GetWL(0.0f) < -0.995) p /= 5;

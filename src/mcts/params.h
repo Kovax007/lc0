@@ -206,6 +206,9 @@ class SearchParams {
   float GetDesperationPriorWeight() const { return kDesperationPriorWeight; }
   bool GetUseDesperation() const { return kUseDesperation;  }
 
+  float GetPolicyDecayExponent() const { return kPolicyDecayExponent; }
+  float GetPolicyDecayFactor() const { return kPolicyDecayFactor; }
+
 	
 
 	float GetTopPolicyBoost() const { return kTopPolicyBoost; }
@@ -312,6 +315,9 @@ class SearchParams {
   static const OptionId kUseUncertaintyWeightingId;
   static const OptionId kEasyEvalWeightDecayId;
   static const OptionId kSearchSpinBackoffId;
+
+  static const OptionId kPolicyDecayExponentId;
+  static const OptionId kPolicyDecayFactorId;
 
 
   static const OptionId kCpuctUncertaintyMinFactorId;
@@ -427,6 +433,9 @@ class SearchParams {
   const float kTopPolicyTierTwoBoost;
   const int kTopPolicyTierTwoNumBoost;
   const bool kUsePolicyBoosting;
+
+  const float kPolicyDecayExponent;
+  const float kPolicyDecayFactor;
 
 
   const float kDesperationMultiplier;
