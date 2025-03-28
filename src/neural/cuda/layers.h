@@ -340,7 +340,7 @@ class EncoderBlock {
                int heads, int size, float alpha,
                DataType* smolgen_global_scratch, int smolgen_global_size,
                int max_batch_size, ActivationFunction smolgen_act,
-               ActivationFunction ffn_act, bool fused_mha);
+               ActivationFunction ffn_act, bool fused_mha, float default_eps);
   ~EncoderBlock();
 
   void Eval(int N, DataType* inpop, DataType* scratch0, DataType* scratch1,
@@ -353,6 +353,8 @@ class EncoderBlock {
   DataType *mha_v_w, *mha_v_b;
   DataType *mha_qkv_w, *mha_qkv_b;
   DataType *mha_dense_w, *mha_dense_b;
+  DataType *mha_rpe_q, *mha_rpe_k, *mha_rpe_v;
+  DataType *mha_rpe_factorizer;
 
   DataType *ln1_gammas, *ln1_betas;
 
@@ -372,6 +374,9 @@ class EncoderBlock {
   int mha_k_size_;
   int mha_v_size_;
   int mha_dense_size_;
+  int mha_rpe_q_size_;
+  int mha_rpe_k_size_;
+  int mha_rpe_v_size_;
 
   int ffn_dense1_size_;
   int ffn_dense2_size_;
@@ -380,6 +385,7 @@ class EncoderBlock {
   int encoder_heads_;
 
   float alpha_;  // scale to apply to skip connection add
+  float default_eps_;  // value of epsilon where it wasn't specified in training
 
   const bool has_smolgen_;
   const bool use_fused_mha_;

@@ -80,6 +80,9 @@ struct LegacyWeights {
     Vec dense_b;
     Smolgen smolgen;
     bool has_smolgen;
+    Vec rpe_q;
+    Vec rpe_k;
+    Vec rpe_v;
   };
 
   struct FFN {
