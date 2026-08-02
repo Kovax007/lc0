@@ -2227,6 +2227,16 @@ void SearchWorker::SetEdgePriors(NodeToProcess* node_to_process) {
   // and w_s is literally the share of probability mass the soft head's ordered
   // tail contributes.
   if (w_o > 0.0f || w_s > 0.0f) {
+    // Weights past the simplex would leave the mixture summing to w_o + w_s
+    // rather than 1, and a uniform scale on the prior is indistinguishable
+    // from scaling CPuct. Normalize the weights instead, which drops the
+    // vanilla head and keeps the ratio between the other two. Inside the
+    // simplex this is exactly the old arithmetic.
+    const float w_sum = w_o + w_s;
+    if (w_sum > 1.0f) {
+      w_o /= w_sum;
+      w_s /= w_sum;
+    }
     const float w_v = std::max(0.0f, 1.0f - w_o - w_s);
     for (size_t i = 0; i < n_edges; ++i) blended[i] = w_v * p[i];
     if (w_o > 0.0f) {
