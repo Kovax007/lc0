@@ -52,6 +52,15 @@ struct InputPlane {
 };
 using InputPlanes = std::vector<InputPlane>;
 
+// Multihead networks carry more than one policy head. Besides the one the
+// backend was configured with, search can ask for the optimistic and the soft
+// head so it can blend them into the prior.
+struct ExtraPolicyHeads {
+  bool optimistic = false;
+  bool soft = false;
+  bool Any() const { return optimistic || soft; }
+};
+
 // An interface to implement by computing backends.
 class NetworkComputation {
  public:
@@ -67,6 +76,22 @@ class NetworkComputation {
   // Returns P value @move_id of @sample.
   virtual float GetPVal(int sample, int move_id) const = 0;
   virtual float GetMVal(int sample) const = 0;
+
+  // Asks for the given extra policy heads to be produced by the next
+  // ComputeBlocking(), and returns the subset that will actually be produced.
+  // Backends that don't implement extra heads return none, which makes the
+  // caller fall back to the single configured head.
+  virtual ExtraPolicyHeads RequestExtraPolicyHeads(ExtraPolicyHeads) {
+    return {};
+  }
+  // Only valid for the heads RequestExtraPolicyHeads() confirmed.
+  virtual float GetPValOptimistic(int /* sample */, int /* move_id */) const {
+    return 0.0f;
+  }
+  virtual float GetPValSoft(int /* sample */, int /* move_id */) const {
+    return 0.0f;
+  }
+
   virtual ~NetworkComputation() = default;
 };
 
@@ -122,6 +147,9 @@ class Network {
   virtual bool IsCpu() const { return false; }
   virtual int GetMiniBatchSize() const { return 256; }
   virtual int GetPreferredBatchStep() const { return 1; }
+  // Extra policy heads this network can produce on request, i.e. heads that
+  // are present in the weights file and implemented by this backend.
+  virtual ExtraPolicyHeads SupportedExtraPolicyHeads() const { return {}; }
   virtual ~Network() = default;
 };
 

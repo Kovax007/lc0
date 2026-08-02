@@ -2105,6 +2105,12 @@ void SearchWorker::ExtendNode(NodeToProcess& picked_node) {
     picked_node.tt_low_node = std::make_shared<LowNode>(legal_moves);
     picked_node.nn_queried = true;
     picked_node.eval->p.resize(legal_moves.size());
+    if (blend_heads_.optimistic) {
+      picked_node.eval->p_optimistic.resize(legal_moves.size());
+    }
+    if (blend_heads_.soft) {
+      picked_node.eval->p_soft.resize(legal_moves.size());
+    }
     picked_node.is_cache_hit = computation_->AddInput(
                                    EvalPosition{
                                        .pos = history.GetPositions(),
@@ -2131,6 +2137,87 @@ void SearchWorker::FetchMinibatchResults() {
   }
 }
 
+// Mixes the extra policy heads into the prior before it is written to the
+// node, in place in the eval's policy vector.
+//
+// With every blend option at its default this returns immediately and the
+// prior stays bit-identical to an unpatched build.
+//
+// When enabled the prior becomes a mixture of normalized distributions
+//   P = w_v * P_vanilla + w_o * P_optimistic + w_s * P_soft   (w_v = 1-w_o-w_s)
+// with an optional re-tempering of the soft head first. Both act on the
+// distribution the backend already softmaxed at PolicySoftmaxTemp, which is
+// where a prior blend belongs: raising that distribution to the power PST/T
+// is identical to softmaxing the raw logits at temperature T.
+//
+// Unlike classic search, this is a DAG: the prior lives on a LowNode that
+// every transposing parent shares, and it is written once, when the position
+// is first expanded. So the per-node-class weights are chosen by the ply at
+// which the position was *first reached* -- the root uses the plain options,
+// a position first reached at ply <= PolicyBlendMaxPly uses the ...Internal
+// options, and one first reached deeper is never blended. A position later
+// reached at a different ply keeps the prior it was given, exactly as it
+// keeps the evaluation it was given.
+void SearchWorker::BlendPolicy(NodeToProcess* node_to_process) {
+  if (!blend_heads_.Any()) return;
+
+  std::vector<float>& p = node_to_process->eval->p;
+  const size_t n_edges = p.size();
+  Node* node = node_to_process->node;
+  const bool is_root = node == search_->root_node_;
+  // path holds the root as its first element, so its length past the root is
+  // the ply distance of this node from the root.
+  const int ply = static_cast<int>(node_to_process->path.size()) - 1;
+  const bool blend_ply = is_root || ply <= params_.GetPolicyBlendMaxPly();
+
+  float w_o = 0.0f;
+  if (blend_heads_.optimistic && blend_ply &&
+      node_to_process->eval->p_optimistic.size() == n_edges) {
+    w_o = params_.GetPolicyBlendOptimisticWeight(is_root);
+  }
+  float w_s = 0.0f;
+  if (blend_heads_.soft && blend_ply &&
+      node_to_process->eval->p_soft.size() == n_edges) {
+    w_s = params_.GetPolicyBlendSoftWeight(is_root);
+  }
+  if (w_o <= 0.0f && w_s <= 0.0f) return;
+
+  // Every term is a normalized distribution, so the result is normalized too
+  // and w_s is literally the share of probability mass the soft head's
+  // ordered tail contributes.
+  const float w_v = std::max(0.0f, 1.0f - w_o - w_s);
+  for (size_t i = 0; i < n_edges; ++i) p[i] *= w_v;
+  if (w_o > 0.0f) {
+    const std::vector<float>& p_opt = node_to_process->eval->p_optimistic;
+    for (size_t i = 0; i < n_edges; ++i) p[i] += w_o * p_opt[i];
+  }
+  if (w_s > 0.0f) {
+    const std::vector<float>& p_soft = node_to_process->eval->p_soft;
+    const float soft_exponent = params_.GetPolicyBlendSoftExponent();
+    if (soft_exponent == 1.0f) {
+      for (size_t i = 0; i < n_edges; ++i) p[i] += w_s * p_soft[i];
+    } else {
+      // Re-temper the soft head before mixing it in. thread_local rather than
+      // a member because this runs both on the search thread and on task
+      // workers, through out-of-order evaluation.
+      thread_local std::vector<float> tempered_soft;
+      tempered_soft.clear();
+      tempered_soft.reserve(n_edges);
+      double soft_sum = 0.0;
+      for (size_t i = 0; i < n_edges; ++i) {
+        const float t = std::pow(p_soft[i], soft_exponent);
+        tempered_soft.push_back(t);
+        soft_sum += t;
+      }
+      const float soft_scale =
+          soft_sum > 0.0 ? static_cast<float>(w_s / soft_sum) : 0.0f;
+      for (size_t i = 0; i < n_edges; ++i) {
+        p[i] += soft_scale * tempered_soft[i];
+      }
+    }
+  }
+}
+
 void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process) {
   if (!node_to_process->nn_queried) return;
 
@@ -2152,6 +2239,7 @@ void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process) {
     }
   };
   wdl_rescale();
+  BlendPolicy(node_to_process);
   node_to_process->tt_low_node->SetNNEval(node_to_process->eval.get());
   node_to_process->tt_low_node->SortEdges();
 

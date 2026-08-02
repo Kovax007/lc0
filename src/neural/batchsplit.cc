@@ -43,6 +43,10 @@ class BatchSplittingBackend : public Backend {
   }
   std::unique_ptr<BackendComputation> CreateComputation() override;
 
+  ExtraPolicyHeads SupportedExtraPolicyHeads() const override {
+    return wrapped_backend_->SupportedExtraPolicyHeads();
+  }
+
   UpdateConfigurationResult UpdateConfiguration(
       const OptionsDict& options) override {
     return wrapped_backend_->UpdateConfiguration(options);

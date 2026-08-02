@@ -255,6 +255,18 @@ class SearchWorker {
     max_out_of_order_ =
         std::max(1, static_cast<int>(params_.GetMaxOutOfOrderEvalsFactor() *
                                      target_minibatch_size_));
+    // Which extra policy heads to fetch for the prior blend: what the options
+    // ask for, narrowed to what the network and backend can produce.
+    const ExtraPolicyHeads supported =
+        search_->backend_->SupportedExtraPolicyHeads();
+    blend_heads_.optimistic =
+        params_.GetPolicyBlendOptimisticActive() && supported.optimistic;
+    blend_heads_.soft = params_.GetPolicyBlendSoftActive() && supported.soft;
+    if ((params_.GetPolicyBlendOptimisticActive() && !supported.optimistic) ||
+        (params_.GetPolicyBlendSoftActive() && !supported.soft)) {
+      CERR << "Policy blend requested but the network or backend does not "
+              "expose the head; the prior falls back to the single head.";
+    }
   }
 
   ~SearchWorker();
@@ -509,6 +521,9 @@ class SearchWorker {
   bool ShouldStopPickingHere(Node* node, bool is_root_node, int repetitions);
   void ProcessPickedTask(int batch_start, int batch_end);
   void ExtendNode(NodeToProcess& picked_node);
+  void BlendPolicy(NodeToProcess* node_to_process);
+  // Extra policy heads actually fetched for the prior blend.
+  ExtraPolicyHeads blend_heads_;
   void FetchSingleNodeResult(NodeToProcess* node_to_process);
   std::tuple<PickTask*, int, int> PickTaskToProcess();
   void ProcessTask(PickTask* task, int id,

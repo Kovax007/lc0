@@ -529,6 +529,66 @@ const OptionId BaseSearchParams::kGarbageCollectionDelayId{
     "garbage-collection-delay", "GarbageCollectionDelay",
     "The percentage of expected move time until garbage collection start. "
     "Delay lets search find transpositions to freed search tree branches."};
+const OptionId BaseSearchParams::kDualTempSoftWeightId{
+    "dual-temp-soft-weight", "DualTempSoftWeight",
+    "Mixture weight of an extra-tempered copy of the policy vector in "
+    "the root node prior: P = (1-w)*P_pst + w*normalize(P_pst^(PST/T)), "
+    "with T given by DualTempSoftT. Lifts the ordered tail of a sharp "
+    "policy so low-prior-but-correct moves get a first visit sooner. 0 "
+    "disables (default), which keeps the prior bit-identical to stock. "
+    "Classic search only."};
+const OptionId BaseSearchParams::kDualTempSoftWeightInternalId{
+    "dual-temp-soft-weight-internal", "DualTempSoftWeightInternal",
+    "Same as DualTempSoftWeight but for non-root nodes up to "
+    "DualTempMaxPly plies from the root. Visits at the tip of the "
+    "principal variation are the product of the per-ply top-move shares, "
+    "so a tail tax applied at every ply compounds; keep this well below "
+    "the root weight, or at 0 (default)."};
+const OptionId BaseSearchParams::kDualTempSoftTId{
+    "dual-temp-soft-t", "DualTempSoftT",
+    "Temperature of the soft component of the dual-temperature prior, on "
+    "the same scale as PolicySoftmaxTemp (larger = flatter). Only has an "
+    "effect when a DualTempSoftWeight is non-zero."};
+const OptionId BaseSearchParams::kDualTempMaxPlyId{
+    "dual-temp-max-ply", "DualTempMaxPly",
+    "Largest distance from the root, in plies, at which "
+    "DualTempSoftWeightInternal is applied. The root itself (ply 0) "
+    "always uses DualTempSoftWeight. 0 means the soft component is "
+    "applied at the root only."};
+const OptionId BaseSearchParams::kPolicyBlendOptimisticWeightId{
+    "policy-blend-optimistic-weight", "PolicyBlendOptimisticWeight",
+    "Mixture weight of the network's optimistic policy head in the root "
+    "node prior: P = w_v*P_vanilla + w_o*P_optimistic + w_s*P_soft, with "
+    "w_v = 1 - w_o - w_s. Requires a network with an optimistic policy "
+    "head and a backend that exposes it; warns and stays at the vanilla "
+    "head otherwise. 0 disables (default). Classic search only."};
+const OptionId BaseSearchParams::kPolicyBlendOptimisticWeightInternalId{
+    "policy-blend-optimistic-weight-internal", "PolicyBlendOptimisticWeightInternal",
+    "Same as PolicyBlendOptimisticWeight but for non-root nodes up to "
+    "PolicyBlendMaxPly plies from the root."};
+const OptionId BaseSearchParams::kPolicyBlendSoftWeightId{
+    "policy-blend-soft-weight", "PolicyBlendSoftWeight",
+    "Mixture weight of the network's soft policy head in the root node "
+    "prior. The soft head has an ordered tail, so this adds an exact "
+    "additive floor of w_s*P_soft to every move. 0 disables (default). "
+    "Classic search only."};
+const OptionId BaseSearchParams::kPolicyBlendSoftWeightInternalId{
+    "policy-blend-soft-weight-internal", "PolicyBlendSoftWeightInternal",
+    "Same as PolicyBlendSoftWeight but for non-root nodes up to "
+    "PolicyBlendMaxPly plies from the root."};
+const OptionId BaseSearchParams::kPolicyBlendSoftTempId{
+    "policy-blend-soft-temp", "PolicyBlendSoftTemp",
+    "Extra temperature applied to the soft policy head before it is "
+    "mixed in, on the same scale as PolicySoftmaxTemp. Networks trained "
+    "on a sharp target have a sharp soft head too, so flattening it "
+    "further can be needed. 0 (default) uses the head as the backend "
+    "produced it."};
+const OptionId BaseSearchParams::kPolicyBlendMaxPlyId{
+    "policy-blend-max-ply", "PolicyBlendMaxPly",
+    "Largest distance from the root, in plies, at which the "
+    "PolicyBlend...Internal weights are applied. The root itself (ply 0) "
+    "always uses the non-Internal weights. 0 means blend at the root "
+    "only."};
 
 const OptionId SearchParams::kMaxPrefetchBatchId{
     "max-prefetch", "MaxPrefetch",
@@ -631,6 +691,18 @@ void BaseSearchParams::Populate(OptionsParser* options) {
   options->Add<FloatOption>(kUCIRatingAdvId, -10000.0f, 10000.0f) = 0.0f;
   options->Add<BoolOption>(kSearchSpinBackoffId) = false;
   options->Add<FloatOption>(kGarbageCollectionDelayId, 0.0f, 100.0f) = 10.0f;
+  options->Add<FloatOption>(kDualTempSoftWeightId, 0.0f, 1.0f) = 0.0f;
+  options->Add<FloatOption>(kDualTempSoftWeightInternalId, 0.0f, 1.0f) = 0.0f;
+  options->Add<FloatOption>(kDualTempSoftTId, 0.1f, 20.0f) = 3.0f;
+  options->Add<IntOption>(kDualTempMaxPlyId, 0, 99) = 0;
+  options->Add<FloatOption>(kPolicyBlendOptimisticWeightId, 0.0f, 1.0f) = 0.0f;
+  options->Add<FloatOption>(kPolicyBlendOptimisticWeightInternalId, 0.0f,
+                            1.0f) = 0.0f;
+  options->Add<FloatOption>(kPolicyBlendSoftWeightId, 0.0f, 1.0f) = 0.0f;
+  options->Add<FloatOption>(kPolicyBlendSoftWeightInternalId, 0.0f, 1.0f) =
+      0.0f;
+  options->Add<FloatOption>(kPolicyBlendSoftTempId, 0.0f, 20.0f) = 0.0f;
+  options->Add<IntOption>(kPolicyBlendMaxPlyId, 0, 99) = 0;
 }
 
 void SearchParams::Populate(OptionsParser* options) {
@@ -725,7 +797,21 @@ BaseSearchParams::BaseSearchParams(const OptionsDict& options)
       kMaxCollisionVisitsScalingPower(
           options.Get<float>(kMaxCollisionVisitsScalingPowerId)),
       kSearchSpinBackoff(options_.Get<bool>(kSearchSpinBackoffId)),
-      kGarbageCollectionDelay(options_.Get<float>(kGarbageCollectionDelayId)) {}
+      kGarbageCollectionDelay(options_.Get<float>(kGarbageCollectionDelayId)),
+      kDualTempSoftWeight(options_.Get<float>(kDualTempSoftWeightId)),
+      kDualTempSoftWeightInternal(
+          options_.Get<float>(kDualTempSoftWeightInternalId)),
+      kDualTempSoftT(options_.Get<float>(kDualTempSoftTId)),
+      kDualTempMaxPly(options_.Get<int>(kDualTempMaxPlyId)),
+      kPolicyBlendOptimisticWeight(
+          options_.Get<float>(kPolicyBlendOptimisticWeightId)),
+      kPolicyBlendOptimisticWeightInternal(
+          options_.Get<float>(kPolicyBlendOptimisticWeightInternalId)),
+      kPolicyBlendSoftWeight(options_.Get<float>(kPolicyBlendSoftWeightId)),
+      kPolicyBlendSoftWeightInternal(
+          options_.Get<float>(kPolicyBlendSoftWeightInternalId)),
+      kPolicyBlendSoftTemp(options_.Get<float>(kPolicyBlendSoftTempId)),
+      kPolicyBlendMaxPly(options_.Get<int>(kPolicyBlendMaxPlyId)) {}
 
 SearchParams::SearchParams(const OptionsDict& options)
     : BaseSearchParams(options),

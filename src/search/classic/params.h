@@ -93,6 +93,57 @@ class BaseSearchParams {
   }
   int GetCacheHistoryLength() const { return kCacheHistoryLength; }
   float GetPolicySoftmaxTemp() const { return kPolicySoftmaxTemp; }
+  // Dual-temperature prior (single policy head). Mixture weight of the
+  // extra-tempered copy of the policy vector, by node class.
+  float GetDualTempSoftWeight(bool at_root) const {
+    return at_root ? kDualTempSoftWeight : kDualTempSoftWeightInternal;
+  }
+  float GetDualTempSoftT() const { return kDualTempSoftT; }
+  int GetDualTempMaxPly() const { return kDualTempMaxPly; }
+  // True when any node class can get a non-zero soft mixture weight. When
+  // false the prior computation takes the untouched original code path.
+  bool GetDualTempActive() const {
+    return (kDualTempSoftWeight > 0.0f ||
+            (kDualTempSoftWeightInternal > 0.0f && kDualTempMaxPly > 0)) &&
+           kDualTempSoftT > 0.0f;
+  }
+  // Exponent that turns the prior the backend already softmaxed at
+  // PolicySoftmaxTemp into one softmaxed at DualTempSoftT:
+  // normalize(p_pst^(PST/T_soft)) == normalize(softmax(logits/T_soft)).
+  float GetDualTempExponent() const {
+    return kPolicySoftmaxTemp / kDualTempSoftT;
+  }
+  // Mixture weight of the optimistic policy head, by node class.
+  float GetPolicyBlendOptimisticWeight(bool at_root) const {
+    return at_root ? kPolicyBlendOptimisticWeight
+                   : kPolicyBlendOptimisticWeightInternal;
+  }
+  // Mixture weight of the soft policy head, by node class.
+  float GetPolicyBlendSoftWeight(bool at_root) const {
+    return at_root ? kPolicyBlendSoftWeight : kPolicyBlendSoftWeightInternal;
+  }
+  float GetPolicyBlendSoftTemp() const { return kPolicyBlendSoftTemp; }
+  int GetPolicyBlendMaxPly() const { return kPolicyBlendMaxPly; }
+  // True when the optimistic head has to be evaluated and blended in.
+  bool GetPolicyBlendOptimisticActive() const {
+    return kPolicyBlendOptimisticWeight > 0.0f ||
+           (kPolicyBlendOptimisticWeightInternal > 0.0f &&
+            kPolicyBlendMaxPly > 0);
+  }
+  // True when the soft head has to be evaluated and blended in.
+  bool GetPolicyBlendSoftActive() const {
+    return kPolicyBlendSoftWeight > 0.0f ||
+           (kPolicyBlendSoftWeightInternal > 0.0f && kPolicyBlendMaxPly > 0);
+  }
+  bool GetPolicyBlendActive() const {
+    return GetPolicyBlendOptimisticActive() || GetPolicyBlendSoftActive();
+  }
+  // Exponent applied to the soft head before mixing, same relation as
+  // GetDualTempExponent(). 0 (option value 0) means "leave the head alone".
+  float GetPolicyBlendSoftExponent() const {
+    return kPolicyBlendSoftTemp > 0.0f ? kPolicySoftmaxTemp / kPolicyBlendSoftTemp
+                                       : 1.0f;
+  }
   int GetMaxCollisionEvents() const { return kMaxCollisionEvents; }
   int GetMaxCollisionVisits() const { return kMaxCollisionVisits; }
   bool GetOutOfOrderEval() const { return kOutOfOrderEval; }
@@ -231,6 +282,16 @@ class BaseSearchParams {
   static const OptionId kUCIRatingAdvId;
   static const OptionId kSearchSpinBackoffId;
   static const OptionId kGarbageCollectionDelayId;
+  static const OptionId kDualTempSoftWeightId;
+  static const OptionId kDualTempSoftWeightInternalId;
+  static const OptionId kDualTempSoftTId;
+  static const OptionId kDualTempMaxPlyId;
+  static const OptionId kPolicyBlendOptimisticWeightId;
+  static const OptionId kPolicyBlendOptimisticWeightInternalId;
+  static const OptionId kPolicyBlendSoftWeightId;
+  static const OptionId kPolicyBlendSoftWeightInternalId;
+  static const OptionId kPolicyBlendSoftTempId;
+  static const OptionId kPolicyBlendMaxPlyId;
 
  protected:
   const OptionsDict& options_;
@@ -290,6 +351,16 @@ class BaseSearchParams {
   const float kMaxCollisionVisitsScalingPower;
   const bool kSearchSpinBackoff;
   const float kGarbageCollectionDelay;
+  const float kDualTempSoftWeight;
+  const float kDualTempSoftWeightInternal;
+  const float kDualTempSoftT;
+  const int kDualTempMaxPly;
+  const float kPolicyBlendOptimisticWeight;
+  const float kPolicyBlendOptimisticWeightInternal;
+  const float kPolicyBlendSoftWeight;
+  const float kPolicyBlendSoftWeightInternal;
+  const float kPolicyBlendSoftTemp;
+  const int kPolicyBlendMaxPly;
 };
 
 class SearchParams : public BaseSearchParams {

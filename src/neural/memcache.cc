@@ -48,13 +48,35 @@ struct CachedValue {
   float m;
   uint8_t num_moves;
   std::unique_ptr<float[]> p;
+  // Only allocated when a caller asked for the extra policy heads and the
+  // backend produced them, so an entry cached by a plain query cannot serve a
+  // blending query.
+  std::unique_ptr<float[]> p_optimistic;
+  std::unique_ptr<float[]> p_soft;
 };
+
+// Whether the cached entry can serve a request that wants the given extra
+// heads.
+bool CachedValueSatisfies(const CachedValue& cv, const EvalResultPtr& ptr) {
+  if (!ptr.p_optimistic.empty() && !cv.p_optimistic) return false;
+  if (!ptr.p_soft.empty() && !cv.p_soft) return false;
+  return true;
+}
 
 void CachedValueToEvalResult(const CachedValue& cv, const EvalResultPtr& ptr) {
   if (ptr.d) *ptr.d = cv.d;
   if (ptr.q) *ptr.q = cv.q;
   if (ptr.m) *ptr.m = cv.m;
   std::copy(cv.p.get(), cv.p.get() + ptr.p.size(), ptr.p.begin());
+  if (cv.p_optimistic && !ptr.p_optimistic.empty()) {
+    std::copy(cv.p_optimistic.get(),
+              cv.p_optimistic.get() + ptr.p_optimistic.size(),
+              ptr.p_optimistic.begin());
+  }
+  if (cv.p_soft && !ptr.p_soft.empty()) {
+    std::copy(cv.p_soft.get(), cv.p_soft.get() + ptr.p_soft.size(),
+              ptr.p_soft.begin());
+  }
 }
 
 class MemCache : public CachingBackend {
@@ -69,6 +91,10 @@ class MemCache : public CachingBackend {
   }
   std::unique_ptr<BackendComputation> CreateComputation() override;
   std::optional<EvalResult> GetCachedEvaluation(const EvalPosition&) override;
+
+  ExtraPolicyHeads SupportedExtraPolicyHeads() const override {
+    return wrapped_backend_->SupportedExtraPolicyHeads();
+  }
 
   void ClearCache() override { cache_.Clear(); }
 
@@ -121,7 +147,8 @@ class MemCacheComputation : public BackendComputation {
       // against hash collisions.
       if (lock.holds_value() &&
           (pos.legal_moves.empty() ||
-           (lock->p && lock->num_moves == pos.legal_moves.size()))) {
+           (lock->p && lock->num_moves == pos.legal_moves.size())) &&
+          CachedValueSatisfies(**lock, result)) {
         CachedValueToEvalResult(**lock, result);
         return AddInputResult::FETCHED_IMMEDIATELY;
       }
@@ -129,14 +156,28 @@ class MemCacheComputation : public BackendComputation {
     size_t entry_idx = entries_.emplace_back(
         Entry{hash, std::make_unique<CachedValue>(), result});
     auto& value = entries_[entry_idx].value;
-    value->p.reset(pos.legal_moves.empty() ? nullptr
-                                           : new float[pos.legal_moves.size()]);
-    value->num_moves = pos.legal_moves.size();
+    const size_t num_moves = pos.legal_moves.size();
+    value->p.reset(pos.legal_moves.empty() ? nullptr : new float[num_moves]);
+    value->num_moves = num_moves;
+    const bool want_optimistic = value->p && !result.p_optimistic.empty();
+    const bool want_soft = value->p && !result.p_soft.empty();
+    if (want_optimistic) value->p_optimistic.reset(new float[num_moves]);
+    if (want_soft) value->p_soft.reset(new float[num_moves]);
     return wrapped_computation_->AddInput(
-        pos, EvalResultPtr{&value->q, &value->d, &value->m,
-                           value->p ? std::span<float>{value->p.get(),
-                                                       pos.legal_moves.size()}
-                                    : std::span<float>{}});
+        pos,
+        EvalResultPtr{
+            .q = &value->q,
+            .d = &value->d,
+            .m = &value->m,
+            .p = value->p ? std::span<float>{value->p.get(), num_moves}
+                          : std::span<float>{},
+            .p_optimistic =
+                want_optimistic
+                    ? std::span<float>{value->p_optimistic.get(), num_moves}
+                    : std::span<float>{},
+            .p_soft = want_soft
+                          ? std::span<float>{value->p_soft.get(), num_moves}
+                          : std::span<float>{}});
   }
 
   virtual void ComputeBlocking() override {

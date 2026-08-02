@@ -57,6 +57,11 @@ using namespace cudnn_backend;
 template <typename DataType>
 class CudaNetwork;
 
+// Policy heads of a multihead network that search can ask for on top of the
+// one the backend was configured with, in ExtraPolicyHeadIndex order.
+static constexpr const char* kExtraPolicyHeadNames[kNumExtraPolicyHeads] = {
+    "optimistic", "soft"};
+
 static size_t getMaxAttentionHeadSize(
     const MultiHeadWeights::PolicyHead& weights, int N) {
   const size_t embedding_op_size = weights.ip_pol_b.size();
@@ -189,12 +194,37 @@ class CudaNetworkComputation : public NetworkComputation {
     return 0.0f;
   }
 
+  // Narrows the request down to the heads this network has, and makes the next
+  // ComputeBlocking() run them.
+  ExtraPolicyHeads RequestExtraPolicyHeads(ExtraPolicyHeads wanted) override;
+
+  float GetPValOptimistic(int sample, int move_id) const override {
+    return GetPValExtra(kExtraPolicyOptimistic, sample, move_id);
+  }
+
+  float GetPValSoft(int sample, int move_id) const override {
+    return GetPValExtra(kExtraPolicySoft, sample, move_id);
+  }
+
  private:
+  float GetPValExtra(int head, int sample, int move_id) const {
+    return FromType(inputs_outputs_->op_policy_extra_mem_
+                        [head][sample * kNumOutputPolicy + move_id]);
+  }
+
   // Memory holding inputs, outputs.
   std::unique_ptr<InputsOutputs<DataType>> inputs_outputs_;
   int batch_size_;
   bool wdl_;
   bool moves_left_;
+  // Extra policy heads this computation will run, all off by default so that
+  // a plain search runs exactly the stock network.
+  ExtraPolicyHeads extra_heads_;
+  // Heads to run whether or not anybody asked, from the
+  // force_extra_policy_heads backend option. backendbench drives the backend
+  // with an empty EvalResultPtr and so never requests anything, so this is
+  // the only way to measure what the extra heads cost on the GPU.
+  ExtraPolicyHeads forced_heads_;
 
   CudaNetwork<DataType>* network_;
 };
@@ -394,10 +424,20 @@ class CudaNetwork : public Network {
     }
 
     // Attention policy head or body may need more memory
-    const size_t attentionPolicySize =
+    size_t attentionPolicySize =
         getMaxAttentionHeadSize(weights.policy_heads.at(policy_head),
                                 max_batch_size_) *
         sizeof(DataType);
+    // The extra policy heads run over the same scratch allocation, so it has
+    // to fit the largest of them too.
+    for (const char* extra_head : kExtraPolicyHeadNames) {
+      if (!weights.policy_heads.contains(extra_head)) continue;
+      attentionPolicySize = std::max(
+          attentionPolicySize,
+          getMaxAttentionHeadSize(weights.policy_heads.at(extra_head),
+                                  max_batch_size_) *
+              sizeof(DataType));
+    }
 
     const size_t attentionBodySize =
         getMaxAttentionBodySize(weights, max_batch_size_) * sizeof(DataType);
@@ -561,6 +601,62 @@ class CudaNetwork : public Network {
       }
     }
 
+    // Extra policy heads, for search-side prior blending. They read the same
+    // attention body output as the selected head, so they are kept out of
+    // network_ (which forwardEval walks in order) and only run when a
+    // computation asks for them.
+    if (attn_policy_ && attn_body_) {
+      // Reusing the selected head's policy embedding is what makes an extra
+      // head cheap. Turned off, every extra head recomputes its own -- which
+      // is the path a net whose heads do not share the embedding takes
+      // anyway. Exposed so the two can be compared, and as a way out if a
+      // future net trips the detection below.
+      const bool allow_shared_embedding =
+          options.GetOrDefault<bool>("shared_policy_embedding", true);
+      const MultiHeadWeights::PolicyHead& main_head =
+          weights.policy_heads.at(policy_head);
+      for (int i = 0; i < kNumExtraPolicyHeads; i++) {
+        const char* name = kExtraPolicyHeadNames[i];
+        if (policy_head == name || !weights.policy_heads.contains(name)) {
+          continue;
+        }
+        const MultiHeadWeights::PolicyHead& head =
+            weights.policy_heads.at(name);
+        // Multihead nets keep a single policy embedding for all heads: the
+        // weights loader binds every head's ip_pol_w to the same vector unless
+        // the head carries its own. When it is shared, the extra head can pick
+        // up the embedding the selected head already computed and pay only for
+        // its own query/key projections.
+        extra_policy_shares_embedding_[i] =
+            allow_shared_embedding && &head.ip_pol_w == &main_head.ip_pol_w &&
+            &head.ip_pol_b == &main_head.ip_pol_b && head.pol_encoder.empty() &&
+            main_head.pol_encoder.empty();
+        extra_policy_head_[i] = std::make_unique<AttentionPolicyHead<DataType>>(
+            encoder_last_, head, scratch_mem_, attn_body_, act, max_batch_size_,
+            use_gemm_ex, extra_policy_shares_embedding_[i]);
+        auto policymap = std::make_unique<PolicyMapLayer<DataType>>(
+            extra_policy_head_[i].get(), kNumOutputPolicy, 1, 1,
+            64 * 64 + 8 * 24, true);
+        policymap->LoadWeights(kAttnPolicyMap, scratch_mem_);
+        extra_policy_map_[i] = std::move(policymap);
+      }
+      available_extra_heads_.optimistic =
+          extra_policy_head_[kExtraPolicyOptimistic] != nullptr;
+      available_extra_heads_.soft =
+          extra_policy_head_[kExtraPolicySoft] != nullptr;
+
+      // Benchmarking aid: run the extra heads on every computation even when
+      // nothing asked for them, so a tool that drives the backend directly
+      // can measure their cost. Not for play -- the results go nowhere.
+      if (options.GetOrDefault<bool>("force_extra_policy_heads", false)) {
+        forced_extra_heads_ = available_extra_heads_;
+        CERR << "Forcing the extra policy heads on every computation "
+                "(optimistic: " << forced_extra_heads_.optimistic
+             << ", soft: " << forced_extra_heads_.soft
+             << "). This is a benchmarking option.";
+      }
+    }
+
     // Value heads.
     {
       const MultiHeadWeights::ValueHead& head =
@@ -615,6 +711,13 @@ class CudaNetwork : public Network {
     // take max size of all layers
     for (auto& layer : network_) {
       maxSize = std::max(maxSize, layer->GetOutputSize(max_batch_size_));
+    }
+    for (int i = 0; i < kNumExtraPolicyHeads; i++) {
+      if (!extra_policy_head_[i]) continue;
+      maxSize = std::max(maxSize,
+                         extra_policy_head_[i]->GetOutputSize(max_batch_size_));
+      maxSize = std::max(maxSize,
+                         extra_policy_map_[i]->GetOutputSize(max_batch_size_));
     }
 
     if ((attn_policy_ || use_res_block_winograd_fuse_opt_ || attn_body_) &&
@@ -687,18 +790,19 @@ class CudaNetwork : public Network {
         cudaStreamWaitEvent(compute_stream_, io->upload_done_event_, 0));
   }
 
-  void GraphLaunch(InputsOutputs<DataType>* io, int batchSize) {
+  void GraphLaunch(InputsOutputs<DataType>* io, int batchSize, int combo) {
+    auto& graph = io->cuda_graphs_[combo][batchSize - 1];
 #if CUDA_GRAPH_SUPPORTS_EXTERNAL_EVENTS
-    io->cuda_graphs_[batchSize - 1].Launch(io->exec_stream_);
+    graph.Launch(io->exec_stream_);
 #else
     if (!multi_stream_) {
       UploadInputs(io, batchSize);
 
-      io->cuda_graphs_[batchSize - 1].Launch(compute_stream_);
+      graph.Launch(compute_stream_);
       ReportCUDAErrors(
           cudaEventRecord(io->download_done_event_, compute_stream_));
     } else {
-      io->cuda_graphs_[batchSize - 1].Launch(io->exec_stream_);
+      graph.Launch(io->exec_stream_);
       ReportCUDAErrors(
           cudaEventRecord(io->download_done_event_, io->exec_stream_));
     }
@@ -706,7 +810,8 @@ class CudaNetwork : public Network {
   }
 
   void forwardEval(InputsOutputs<DataType>* io, int batchSize,
-                   [[maybe_unused]] bool capture = false) {
+                   [[maybe_unused]] bool capture = false,
+                   ExtraPolicyHeads extra = {}) {
     // It is safe to evaluate larger than the batchSize
     // as all buffers are designed to handle max_batch_size
     // and the extra invalid results are never read.
@@ -724,6 +829,7 @@ class CudaNetwork : public Network {
     void* scratch_mem;
     DataType*** offset_pointers;
     DataType*** head_offset_pointers;
+    void*** extra_head_offset_pointers;
     cudaStream_t compute_stream, upload_stream, download_stream;
     cublasHandle_t cublas;
     if (multi_stream_) {
@@ -733,6 +839,7 @@ class CudaNetwork : public Network {
       scratch_mem = io->scratch_mem_;
       offset_pointers = (DataType***)&io->offset_pointers_;
       head_offset_pointers = (DataType***)&io->head_offset_pointers_;
+      extra_head_offset_pointers = io->extra_head_offset_pointers_;
       compute_stream = io->compute_stream_;
       upload_stream = io->upload_stream_;
       download_stream = io->download_stream_;
@@ -742,6 +849,7 @@ class CudaNetwork : public Network {
       scratch_mem = scratch_mem_;
       offset_pointers = (DataType***)&offset_pointers_;
       head_offset_pointers = (DataType***)&head_offset_pointers_;
+      extra_head_offset_pointers = extra_head_offset_pointers_;
       compute_stream = compute_stream_;
       upload_stream = upload_stream_;
       download_stream = download_stream_;
@@ -883,6 +991,33 @@ class CudaNetwork : public Network {
           scratch_size_, nullptr, cublas,
           compute_stream);  // policy map layer  // POLICY output
 
+      // Extra policy heads over the same body output. spare1 and spare2 are
+      // free again now that the policy map has consumed them, and `flow` is
+      // untouched by the attention policy head, so each extra head is just its
+      // own query/key projections plus a policy map.
+      if (extra.Any()) {
+        const bool wanted[kNumExtraPolicyHeads] = {extra.optimistic,
+                                                   extra.soft};
+        // spare2 still holds the policy embedding the selected head computed.
+        // A head that has to recompute its own embedding overwrites it, so the
+        // heads that reuse it go first.
+        for (int pass = 0; pass < 2; pass++) {
+          const bool shared_pass = pass == 0;
+          for (int i = 0; i < kNumExtraPolicyHeads; i++) {
+            if (!wanted[i] || !extra_policy_head_[i]) continue;
+            if (extra_policy_shares_embedding_[i] != shared_pass) continue;
+            extra_policy_head_[i]->Eval(
+                batchSize, spare1, flow, spare2, scratch_mem, scratch_size_,
+                nullptr, cublas, compute_stream,
+                (DataType***)&extra_head_offset_pointers[i]);
+            extra_policy_map_[i]->Eval(
+                batchSize, (DataType*)io->op_policy_extra_mem_gpu_[i], spare1,
+                nullptr, scratch_mem, scratch_size_, nullptr, cublas,
+                compute_stream);
+          }
+        }
+      }
+
     } else if (conv_policy_) {
       network_[l++]->Eval(batchSize, spare1, flow, nullptr, scratch_mem,
                           scratch_size_, nullptr, cublas,
@@ -914,6 +1049,16 @@ class CudaNetwork : public Network {
         io->op_policy_mem_, io->op_policy_mem_gpu_,
         sizeof(io->op_policy_mem_[0]) * kNumOutputPolicy * batchSize,
         cudaMemcpyDeviceToHost, download_stream));
+    {
+      const bool wanted[kNumExtraPolicyHeads] = {extra.optimistic, extra.soft};
+      for (int i = 0; i < kNumExtraPolicyHeads; i++) {
+        if (!wanted[i] || !extra_policy_head_[i]) continue;
+        ReportCUDAErrors(cudaMemcpyAsync(
+            io->op_policy_extra_mem_[i], io->op_policy_extra_mem_gpu_[i],
+            sizeof(io->op_policy_mem_[0]) * kNumOutputPolicy * batchSize,
+            cudaMemcpyDeviceToHost, download_stream));
+      }
+    }
 
     // value head
     network_[l++]->Eval(batchSize, (DataType*)opVal, flow, spare2, scratch_mem,
@@ -1026,6 +1171,9 @@ class CudaNetwork : public Network {
       if (offset_pointers_) ReportCUDAErrors(cudaFree(offset_pointers_));
       if (head_offset_pointers_)
         ReportCUDAErrors(cudaFree(head_offset_pointers_));
+      for (auto ptrs : extra_head_offset_pointers_) {
+        if (ptrs) ReportCUDAErrors(cudaFree(ptrs));
+      }
       ReportCUBLASErrors(cublasDestroy(cublas_));
       ReportCUDAErrors(cudaStreamDestroy(compute_stream_));
       ReportCUDAErrors(cudaStreamDestroy(upload_stream_));
@@ -1036,6 +1184,14 @@ class CudaNetwork : public Network {
 
   const NetworkCapabilities& GetCapabilities() const override {
     return capabilities_;
+  }
+
+  ExtraPolicyHeads SupportedExtraPolicyHeads() const override {
+    return available_extra_heads_;
+  }
+
+  ExtraPolicyHeads ForcedExtraPolicyHeads() const {
+    return forced_extra_heads_;
   }
 
   int GetMiniBatchSize() const override {
@@ -1068,7 +1224,8 @@ class CudaNetwork : public Network {
     if (free_inputs_outputs_.empty()) {
       return std::make_unique<InputsOutputs<DataType>>(
           max_batch_size_, wdl_, moves_left_, tensor_mem_size_, scratch_size_,
-          !has_tensor_cores_ && std::is_same<half, DataType>::value);
+          !has_tensor_cores_ && std::is_same<half, DataType>::value,
+          available_extra_heads_);
     } else {
       std::unique_ptr<InputsOutputs<DataType>> resource =
           std::move(free_inputs_outputs_.front());
@@ -1118,6 +1275,15 @@ class CudaNetwork : public Network {
   std::vector<std::unique_ptr<BaseLayer<DataType>>> network_;
   BaseLayer<DataType>* getLastLayer() { return network_.back().get(); }
 
+  // Extra policy heads, indexed by ExtraPolicyHeadIndex. Null for a head the
+  // weights file does not have (or that is the selected head already).
+  ExtraPolicyHeads available_extra_heads_;
+  // Benchmarking only: heads to run even when unrequested.
+  ExtraPolicyHeads forced_extra_heads_;
+  std::unique_ptr<BaseLayer<DataType>> extra_policy_head_[kNumExtraPolicyHeads];
+  std::unique_ptr<BaseLayer<DataType>> extra_policy_map_[kNumExtraPolicyHeads];
+  bool extra_policy_shares_embedding_[kNumExtraPolicyHeads] = {};
+
   BaseLayer<DataType>* resi_last_;
   BaseLayer<DataType>* encoder_last_;
 
@@ -1129,6 +1295,7 @@ class CudaNetwork : public Network {
   // this is only used when multi-stream is disabled
   void** offset_pointers_ = nullptr;
   void** head_offset_pointers_ = nullptr;
+  void** extra_head_offset_pointers_[kNumExtraPolicyHeads] = {};
 
   bool has_tensor_cores_;
 
@@ -1216,12 +1383,30 @@ CudaNetworkComputation<DataType>::CudaNetworkComputation(
     CudaNetwork<DataType>* network, bool wdl, bool moves_left)
     : wdl_(wdl), moves_left_(moves_left), network_(network) {
   batch_size_ = 0;
+  // Applied here rather than in RequestExtraPolicyHeads() because a caller
+  // that wants no policy at all, backendbench included, never calls it.
+  forced_heads_ = network_->ForcedExtraPolicyHeads();
+  extra_heads_ = forced_heads_;
   inputs_outputs_ = network_->GetInputsOutputs();
 }
 
 template <typename DataType>
 CudaNetworkComputation<DataType>::~CudaNetworkComputation() {
   network_->ReleaseInputsOutputs(std::move(inputs_outputs_));
+}
+
+template <typename DataType>
+ExtraPolicyHeads CudaNetworkComputation<DataType>::RequestExtraPolicyHeads(
+    ExtraPolicyHeads wanted) {
+  const ExtraPolicyHeads supported = network_->SupportedExtraPolicyHeads();
+  ExtraPolicyHeads produced;
+  produced.optimistic = wanted.optimistic && supported.optimistic;
+  produced.soft = wanted.soft && supported.soft;
+  // Only the requested heads are reported as produced -- the forced ones are
+  // computed but nothing reads them.
+  extra_heads_.optimistic = produced.optimistic || forced_heads_.optimistic;
+  extra_heads_.soft = produced.soft || forced_heads_.soft;
+  return produced;
 }
 
 template <typename DataType>
@@ -1236,25 +1421,31 @@ void CudaNetworkComputation<DataType>::CaptureGraph(
     return;
   }
   auto capture = network_->BeginCapture(*inputs_outputs_);
-  network_->forwardEval(inputs_outputs_.get(), GetBatchSize(), true);
+  network_->forwardEval(inputs_outputs_.get(), GetBatchSize(), true,
+                        extra_heads_);
   capture.EndCapture();
   if (lock.owns_lock()) lock.unlock();
-  inputs_outputs_->cuda_graphs_[GetBatchSize() - 1] = capture;
+  inputs_outputs_->cuda_graphs_[ExtraPolicyHeadCombo(extra_heads_)]
+                               [GetBatchSize() - 1] = capture;
 }
 
 template <typename DataType>
 void CudaNetworkComputation<DataType>::ComputeBlocking() {
   LCTRACE_FUNCTION_SCOPE;
   if (GetBatchSize() == 0) return;
-  if (inputs_outputs_->cuda_graphs_[GetBatchSize() - 1]) {
+  // Graphs are kept per requested head combination, since a graph captured
+  // without the extra heads does not contain their kernels.
+  const int combo = ExtraPolicyHeadCombo(extra_heads_);
+  if (inputs_outputs_->cuda_graphs_[combo][GetBatchSize() - 1]) {
     std::unique_lock<std::mutex> lock = network_->LockEval();
-    network_->GraphLaunch(inputs_outputs_.get(), GetBatchSize());
+    network_->GraphLaunch(inputs_outputs_.get(), GetBatchSize(), combo);
   } else {
     std::unique_lock<std::mutex> lock = network_->LockEval();
 #if !CUDA_GRAPH_SUPPORTS_EXTERNAL_EVENTS
     network_->UploadInputs(inputs_outputs_.get(), GetBatchSize());
 #endif
-    network_->forwardEval(inputs_outputs_.get(), GetBatchSize());
+    network_->forwardEval(inputs_outputs_.get(), GetBatchSize(), false,
+                          extra_heads_);
     CaptureGraph(std::move(lock));
   }
   network_->finishEval(inputs_outputs_.get(), GetBatchSize());

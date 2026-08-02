@@ -729,7 +729,9 @@ class CudnnNetwork : public Network {
     ReportCUDAErrors(cudaStreamSynchronize(io->exec_stream_));
 #endif
 
-    io->cuda_graphs_[batchSize - 1].Launch(compute_stream_);
+    // This backend does not implement the extra policy heads, so it only ever
+    // uses the graphs captured without them.
+    io->cuda_graphs_[0][batchSize - 1].Launch(compute_stream_);
     ReportCUDAErrors(
         cudaEventRecord(io->download_done_event_, compute_stream_));
   }
@@ -1175,13 +1177,13 @@ void CudnnNetworkComputation<DataType>::CaptureGraph(
   network_->forwardEval(inputs_outputs_.get(), GetBatchSize(), true);
   capture.EndCapture();
   if (lock.owns_lock()) lock.unlock();
-  inputs_outputs_->cuda_graphs_[GetBatchSize() - 1] = capture;
+  inputs_outputs_->cuda_graphs_[0][GetBatchSize() - 1] = capture;
 }
 
 template <typename DataType>
 void CudnnNetworkComputation<DataType>::ComputeBlocking() {
   if (GetBatchSize() == 0) return;
-  if (inputs_outputs_->cuda_graphs_[GetBatchSize() - 1]) {
+  if (inputs_outputs_->cuda_graphs_[0][GetBatchSize() - 1]) {
     std::unique_lock<std::mutex> lock = network_->LockEval();
     network_->GraphLaunch(inputs_outputs_.get(), GetBatchSize());
   } else {

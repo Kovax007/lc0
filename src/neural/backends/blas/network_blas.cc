@@ -69,7 +69,8 @@ class BlasComputation : public NetworkComputation {
                   const ActivationFunction smolgen_activation,
                   const ActivationFunction ffn_activation,
                   const bool attn_policy, const bool attn_body,
-                  bool is_pe_dense_embedding, int threads);
+                  bool is_pe_dense_embedding, int threads,
+                  ExtraPolicyHeads available_heads);
 
   virtual ~BlasComputation() {}
 
@@ -115,6 +116,21 @@ class BlasComputation : public NetworkComputation {
     return policies_[sample][move_id];
   }
 
+  float GetPValOptimistic(int sample, int move_id) const override {
+    return policies_optimistic_[sample][move_id];
+  }
+
+  float GetPValSoft(int sample, int move_id) const override {
+    return policies_soft_[sample][move_id];
+  }
+
+  // Narrows the request down to the heads this network actually has.
+  ExtraPolicyHeads RequestExtraPolicyHeads(ExtraPolicyHeads wanted) override {
+    extra_heads_.optimistic = wanted.optimistic && available_heads_.optimistic;
+    extra_heads_.soft = wanted.soft && available_heads_.soft;
+    return extra_heads_;
+  }
+
  private:
   void EncodePlanes(const InputPlanes& sample, float* buffer);
   void ForwardEncoderLayer(
@@ -136,6 +152,14 @@ class BlasComputation : public NetworkComputation {
   size_t max_batch_size_;
   std::vector<InputPlanes> planes_;
   std::vector<std::vector<float>> policies_;
+  // Filled only for the extra policy heads requested for this computation.
+  std::vector<std::vector<float>> policies_optimistic_;
+  std::vector<std::vector<float>> policies_soft_;
+  // Copy of the body output, so a second and third policy head can be run
+  // over it after the first one has overwritten the buffer.
+  std::vector<float> policy_input_backup_;
+  ExtraPolicyHeads available_heads_;
+  ExtraPolicyHeads extra_heads_;
   std::vector<float> q_values_;
   std::vector<float> m_values_;
   bool wdl_;
@@ -163,7 +187,19 @@ class BlasNetwork : public Network {
         this, weights_, policy_head_, value_head_, max_batch_size_, wdl_,
         moves_left_, conv_policy_, default_activation_, smolgen_activation_,
         ffn_activation_, attn_policy_, attn_body_, is_pe_dense_embedding_,
-        threads_);
+        threads_, SupportedExtraPolicyHeads());
+  }
+
+  // The extra heads are computed by re-running the policy head on a saved
+  // copy of the attention body output, so they need an attention body with an
+  // attention policy head, plus the head itself in the weights file.
+  ExtraPolicyHeads SupportedExtraPolicyHeads() const override {
+    if (!attn_policy_ || !attn_body_) return {};
+    return ExtraPolicyHeads{
+        .optimistic = weights_.policy_heads.count("optimistic") > 0 &&
+                      policy_head_ != "optimistic",
+        .soft = weights_.policy_heads.count("soft") > 0 &&
+                policy_head_ != "soft"};
   }
 
   const NetworkCapabilities& GetCapabilities() const override {
@@ -224,10 +260,11 @@ BlasComputation<use_eigen>::BlasComputation(
     const ActivationFunction smolgen_activation,
     const ActivationFunction ffn_activation, const bool attn_policy,
     const bool attn_body, bool is_pe_dense_embedding,
-    [[maybe_unused]] int threads)
+    [[maybe_unused]] int threads, ExtraPolicyHeads available_heads)
     : weights_(weights),
       max_batch_size_(max_batch_size),
       policies_(0),
+      available_heads_(available_heads),
       q_values_(0),
       wdl_(wdl),
       moves_left_(moves_left),
@@ -532,6 +569,16 @@ void BlasComputation<use_eigen>::ComputeBlocking() {
   if (attn_policy_) {
     max_head_planes = std::max(std::max(max_head_planes, size_t{67}),
                                policy_head.ip_pol_b.size());
+    // The extra heads share the same scratch buffers, so size for the largest.
+    if (extra_heads_.optimistic) {
+      max_head_planes =
+          std::max(max_head_planes,
+                   weights_.policy_heads.at("optimistic").ip_pol_b.size());
+    }
+    if (extra_heads_.soft) {
+      max_head_planes = std::max(
+          max_head_planes, weights_.policy_heads.at("soft").ip_pol_b.size());
+    }
   }
 
   std::unique_ptr<Buffers> buffers = network_->GetBuffers();
@@ -550,6 +597,8 @@ void BlasComputation<use_eigen>::ComputeBlocking() {
   // Output values.
   q_values_.reserve(wdl_ ? 3 * total_batches : total_batches);
   policies_.reserve(total_batches);
+  if (extra_heads_.optimistic) policies_optimistic_.reserve(total_batches);
+  if (extra_heads_.soft) policies_soft_.reserve(total_batches);
   if (moves_left_) m_values_.resize(total_batches);
 
   WinogradConvolution3<use_eigen> convolve3(largest_batch_size, max_channels,
@@ -802,169 +851,197 @@ void BlasComputation<use_eigen>::ComputeBlocking() {
           &m_values_[start]);
     }
 
-    // Policy head.
-    if (attn_policy_) {
-      if (!attn_body_) {
-        // NCHW to NHWC conversion.
+    // Runs one policy head over the body output and appends this batch
+    // slice's policy vectors to `out`. The attention policy path consumes
+    // buffer1 (the NHWC body output), so a caller running more than one head
+    // has to restore buffer1 in between.
+    auto compute_policy_head =
+        [&](const MultiHeadWeights::PolicyHead& head, size_t batch_size,
+            std::vector<std::vector<float>>& out) {
+      const auto head_input_planes = head.policy.biases.size();
+      if (attn_policy_) {
+        if (!attn_body_) {
+          // NCHW to NHWC conversion.
+          for (auto batch = size_t{0}; batch < batch_size; batch++) {
+            for (auto i = 0; i < kSquares; i++) {
+              for (size_t j = 0; j < output_channels; j++) {
+                buffer1[batch * kSquares * output_channels + i * output_channels +
+                        j] = buffer2[batch * kSquares * output_channels +
+                                     j * kSquares + i];
+              }
+            }
+          }
+        }
+        const size_t policy_embedding_size = head.ip_pol_b.size();
+        // Policy Embedding.
+        FullyConnectedLayer<use_eigen>::Forward1D(
+            batch_size * kSquares, output_channels, policy_embedding_size,
+            buffer1.data(), head.ip_pol_w.data(),
+            head.ip_pol_b.data(),
+            attn_body_
+                ? default_activation_
+                : ACTIVATION_SELU,  // SELU activation hardcoded for apmish nets.
+            buffer2.data());
+
+        const size_t policy_d_model = head.ip2_pol_b.size();
+
+        for (auto& layer : head.pol_encoder) {
+          ForwardEncoderLayer(
+              buffer2, buffer1, buffer3, head_buffer, batch_size, layer,
+              policy_embedding_size, head.pol_encoder_head_count,
+              attn_body_ ? smolgen_activation_ : ACTIVATION_NONE,
+              attn_body_ ? ffn_activation_ : ACTIVATION_SELU, 1.0f, 1e-6);
+        }
+
+        // Q
+        FullyConnectedLayer<use_eigen>::Forward1D(
+            batch_size * kSquares, policy_embedding_size, policy_d_model,
+            buffer2.data(), head.ip2_pol_w.data(),
+            head.ip2_pol_b.data(), ACTIVATION_NONE, buffer1.data());
+        // K
+        FullyConnectedLayer<use_eigen>::Forward1D(
+            batch_size * kSquares, policy_embedding_size, policy_d_model,
+            buffer2.data(), head.ip3_pol_w.data(),
+            head.ip3_pol_b.data(), ACTIVATION_NONE, buffer3.data());
+        const float scaling = 1.0f / sqrtf(policy_d_model);
         for (auto batch = size_t{0}; batch < batch_size; batch++) {
-          for (auto i = 0; i < kSquares; i++) {
-            for (size_t j = 0; j < output_channels; j++) {
-              buffer1[batch * kSquares * output_channels + i * output_channels +
-                      j] = buffer2[batch * kSquares * output_channels +
-                                   j * kSquares + i];
+          const float* A = &buffer1[batch * 64 * policy_d_model];
+          const float* B = &buffer3[batch * 64 * policy_d_model];
+          float* C = &head_buffer[batch * (64 * 64 + 8 * 24)];
+          if (use_eigen) {
+            auto C_mat = EigenMatrixMap<float>(C, kSquares, kSquares);
+            C_mat.noalias() =
+                scaling *
+                ConstEigenMatrixMap<float>(B, policy_d_model, kSquares)
+                    .transpose() *
+                ConstEigenMatrixMap<float>(A, policy_d_model, kSquares);
+          } else {
+  #ifdef USE_BLAS
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, kSquares,
+                        kSquares, policy_d_model, scaling, A, policy_d_model, B,
+                        policy_d_model, 0.0f, C, 64);
+  #else
+            // Should never get here.
+            throw Exception("Blas backend internal error");
+  #endif
+          }
+        }
+        // Promotion offset calculation.
+        for (auto batch = size_t{0}; batch < batch_size; batch++) {
+          float promotion_offsets[4][8];
+          // This is so small that SGEMM seems slower.
+          for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 8; j++) {
+              float sum = 0;
+              for (size_t k = 0; k < policy_d_model; k++) {
+                sum += buffer3[batch * kSquares * policy_d_model +
+                               (56 + j) * policy_d_model + k] *
+                       head.ip4_pol_w[i * policy_d_model + k];
+              }
+              promotion_offsets[i][j] = sum;
+            }
+          }
+          for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 8; j++) {
+              promotion_offsets[i][j] += promotion_offsets[3][j];
+            }
+          }
+          for (int k = 0; k < 8; k++) {      // y in cuda
+            for (int j = 0; j < 8; j++) {    // w in cuda
+              for (int i = 0; i < 3; i++) {  // c in cuda
+                head_buffer[batch * (64 * 64 + 8 * 24) + 64 * 64 + 24 * k +
+                            3 * j + i] = head_buffer[batch * (64 * 64 + 8 * 24) +
+                                                     (48 + k) * 64 + 56 + j] +
+                                         promotion_offsets[i][j];
+              }
             }
           }
         }
-      }
-      const size_t policy_embedding_size = policy_head.ip_pol_b.size();
-      // Policy Embedding.
-      FullyConnectedLayer<use_eigen>::Forward1D(
-          batch_size * kSquares, output_channels, policy_embedding_size,
-          buffer1.data(), policy_head.ip_pol_w.data(),
-          policy_head.ip_pol_b.data(),
-          attn_body_
-              ? default_activation_
-              : ACTIVATION_SELU,  // SELU activation hardcoded for apmish nets.
-          buffer2.data());
-
-      const size_t policy_d_model = policy_head.ip2_pol_b.size();
-
-      for (auto& layer : policy_head.pol_encoder) {
-        ForwardEncoderLayer(
-            buffer2, buffer1, buffer3, head_buffer, batch_size, layer,
-            policy_embedding_size, policy_head.pol_encoder_head_count,
-            attn_body_ ? smolgen_activation_ : ACTIVATION_NONE,
-            attn_body_ ? ffn_activation_ : ACTIVATION_SELU, 1.0f, 1e-6);
-      }
-
-      // Q
-      FullyConnectedLayer<use_eigen>::Forward1D(
-          batch_size * kSquares, policy_embedding_size, policy_d_model,
-          buffer2.data(), policy_head.ip2_pol_w.data(),
-          policy_head.ip2_pol_b.data(), ACTIVATION_NONE, buffer1.data());
-      // K
-      FullyConnectedLayer<use_eigen>::Forward1D(
-          batch_size * kSquares, policy_embedding_size, policy_d_model,
-          buffer2.data(), policy_head.ip3_pol_w.data(),
-          policy_head.ip3_pol_b.data(), ACTIVATION_NONE, buffer3.data());
-      const float scaling = 1.0f / sqrtf(policy_d_model);
-      for (auto batch = size_t{0}; batch < batch_size; batch++) {
-        const float* A = &buffer1[batch * 64 * policy_d_model];
-        const float* B = &buffer3[batch * 64 * policy_d_model];
-        float* C = &head_buffer[batch * (64 * 64 + 8 * 24)];
-        if (use_eigen) {
-          auto C_mat = EigenMatrixMap<float>(C, kSquares, kSquares);
-          C_mat.noalias() =
-              scaling *
-              ConstEigenMatrixMap<float>(B, policy_d_model, kSquares)
-                  .transpose() *
-              ConstEigenMatrixMap<float>(A, policy_d_model, kSquares);
-        } else {
-#ifdef USE_BLAS
-          cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, kSquares,
-                      kSquares, policy_d_model, scaling, A, policy_d_model, B,
-                      policy_d_model, 0.0f, C, 64);
-#else
-          // Should never get here.
-          throw Exception("Blas backend internal error");
-#endif
-        }
-      }
-      // Promotion offset calculation.
-      for (auto batch = size_t{0}; batch < batch_size; batch++) {
-        float promotion_offsets[4][8];
-        // This is so small that SGEMM seems slower.
-        for (int i = 0; i < 4; i++) {
-          for (int j = 0; j < 8; j++) {
-            float sum = 0;
-            for (size_t k = 0; k < policy_d_model; k++) {
-              sum += buffer3[batch * kSquares * policy_d_model +
-                             (56 + j) * policy_d_model + k] *
-                     policy_head.ip4_pol_w[i * policy_d_model + k];
-            }
-            promotion_offsets[i][j] = sum;
-          }
-        }
-        for (int i = 0; i < 3; i++) {
-          for (int j = 0; j < 8; j++) {
-            promotion_offsets[i][j] += promotion_offsets[3][j];
-          }
-        }
-        for (int k = 0; k < 8; k++) {      // y in cuda
-          for (int j = 0; j < 8; j++) {    // w in cuda
-            for (int i = 0; i < 3; i++) {  // c in cuda
-              head_buffer[batch * (64 * 64 + 8 * 24) + 64 * 64 + 24 * k +
-                          3 * j + i] = head_buffer[batch * (64 * 64 + 8 * 24) +
-                                                   (48 + k) * 64 + 56 + j] +
-                                       promotion_offsets[i][j];
+        // Mapping from attention policy to lc0 policy
+        for (auto batch = size_t{0}; batch < batch_size; batch++) {
+          std::vector<float> policy(num_output_policy);
+          for (auto i = 0; i < 64 * 64 + 8 * 24; i++) {
+            auto j = kAttnPolicyMap[i];
+            if (j >= 0) {
+              policy[j] = head_buffer[batch * (64 * 64 + 8 * 24) + i];
             }
           }
+          out.emplace_back(std::move(policy));
         }
-      }
-      // Mapping from attention policy to lc0 policy
-      for (auto batch = size_t{0}; batch < batch_size; batch++) {
-        std::vector<float> policy(num_output_policy);
-        for (auto i = 0; i < 64 * 64 + 8 * 24; i++) {
-          auto j = kAttnPolicyMap[i];
-          if (j >= 0) {
-            policy[j] = head_buffer[batch * (64 * 64 + 8 * 24) + i];
+      } else if (conv_policy_) {
+        assert(!attn_body_);  // not supported with attention body
+        convolve3.Forward(batch_size, output_channels, output_channels,
+                          buffer2.data(), head.policy1.weights.data(),
+                          buffer1.data());
+
+        BiasActivate(batch_size, output_channels, buffer1.data(),
+                     head.policy1.biases.data(), default_activation_);
+
+        convolve3.Forward(batch_size, output_channels, head_input_planes,
+                          buffer1.data(), head.policy.weights.data(),
+                          head_buffer.data());
+
+        BiasActivate(batch_size, head_input_planes, head_buffer.data(),
+                     head.policy.biases.data(), ACTIVATION_NONE);
+
+        // Mapping from convolutional policy to lc0 policy
+        for (auto batch = size_t{0}; batch < batch_size; batch++) {
+          std::vector<float> policy(num_output_policy);
+          for (auto i = 0; i < kPolicyUsedPlanes * kSquares; i++) {
+            auto j = kConvPolicyMap[i];
+            if (j >= 0) {
+              policy[j] =
+                  head_buffer[batch * head_input_planes * kSquares + i];
+            }
           }
+          out.emplace_back(std::move(policy));
         }
-        policies_.emplace_back(std::move(policy));
-      }
-    } else if (conv_policy_) {
-      assert(!attn_body_);  // not supported with attention body
-      convolve3.Forward(batch_size, output_channels, output_channels,
-                        buffer2.data(), policy_head.policy1.weights.data(),
-                        buffer1.data());
 
-      BiasActivate(batch_size, output_channels, buffer1.data(),
-                   policy_head.policy1.biases.data(), default_activation_);
+      } else {
+        assert(!attn_body_);  // not supported with attention body
+        Convolution1<use_eigen>::Forward(
+            batch_size, output_channels, head_input_planes, buffer2.data(),
+            head.policy.weights.data(), head_buffer.data());
 
-      convolve3.Forward(batch_size, output_channels, num_policy_input_planes,
-                        buffer1.data(), policy_head.policy.weights.data(),
-                        head_buffer.data());
+        BiasActivate(batch_size, head_input_planes, &head_buffer[0],
+                     head.policy.biases.data(), default_activation_);
 
-      BiasActivate(batch_size, num_policy_input_planes, head_buffer.data(),
-                   policy_head.policy.biases.data(), ACTIVATION_NONE);
+        FullyConnectedLayer<use_eigen>::Forward1D(
+            batch_size, head_input_planes * kSquares, num_output_policy,
+            head_buffer.data(), head.ip_pol_w.data(),
+            head.ip_pol_b.data(),
+            ACTIVATION_NONE,  // Activation Off
+            buffer3.data());
 
-      // Mapping from convolutional policy to lc0 policy
-      for (auto batch = size_t{0}; batch < batch_size; batch++) {
-        std::vector<float> policy(num_output_policy);
-        for (auto i = 0; i < kPolicyUsedPlanes * kSquares; i++) {
-          auto j = kConvPolicyMap[i];
-          if (j >= 0) {
-            policy[j] =
-                head_buffer[batch * num_policy_input_planes * kSquares + i];
-          }
+        for (size_t j = 0; j < batch_size; j++) {
+          std::vector<float> policy(num_output_policy);
+
+          // Get the moves
+          policy.assign(buffer3.begin() + j * num_output_policy,
+                        buffer3.begin() + (j + 1) * num_output_policy);
+          out.emplace_back(std::move(policy));
         }
-        policies_.emplace_back(std::move(policy));
       }
+    };
 
-    } else {
-      assert(!attn_body_);  // not supported with attention body
-      Convolution1<use_eigen>::Forward(
-          batch_size, output_channels, num_policy_input_planes, buffer2.data(),
-          policy_head.policy.weights.data(), head_buffer.data());
-
-      BiasActivate(batch_size, num_policy_input_planes, &head_buffer[0],
-                   policy_head.policy.biases.data(), default_activation_);
-
-      FullyConnectedLayer<use_eigen>::Forward1D(
-          batch_size, num_policy_input_planes * kSquares, num_output_policy,
-          head_buffer.data(), policy_head.ip_pol_w.data(),
-          policy_head.ip_pol_b.data(),
-          ACTIVATION_NONE,  // Activation Off
-          buffer3.data());
-
-      for (size_t j = 0; j < batch_size; j++) {
-        std::vector<float> policy(num_output_policy);
-
-        // Get the moves
-        policy.assign(buffer3.begin() + j * num_output_policy,
-                      buffer3.begin() + (j + 1) * num_output_policy);
-        policies_.emplace_back(std::move(policy));
-      }
+    // Body output, kept aside when more than one policy head is wanted.
+    if (extra_heads_.Any()) {
+      policy_input_backup_.assign(
+          buffer1.begin(),
+          buffer1.begin() + batch_size * kSquares * output_channels);
+    }
+    compute_policy_head(policy_head, batch_size, policies_);
+    if (extra_heads_.optimistic) {
+      std::copy(policy_input_backup_.begin(), policy_input_backup_.end(),
+                buffer1.begin());
+      compute_policy_head(weights_.policy_heads.at("optimistic"), batch_size,
+                          policies_optimistic_);
+    }
+    if (extra_heads_.soft) {
+      std::copy(policy_input_backup_.begin(), policy_input_backup_.end(),
+                buffer1.begin());
+      compute_policy_head(weights_.policy_heads.at("soft"), batch_size,
+                          policies_soft_);
     }
   }
   network_->ReleaseBuffers(std::move(buffers));

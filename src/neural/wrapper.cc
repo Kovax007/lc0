@@ -67,6 +67,9 @@ class NetworkAsBackend : public Backend {
 
   BackendAttributes GetAttributes() const override { return attrs_; }
   std::unique_ptr<BackendComputation> CreateComputation() override;
+  ExtraPolicyHeads SupportedExtraPolicyHeads() const override {
+    return network_->SupportedExtraPolicyHeads();
+  }
   UpdateConfigurationResult UpdateConfiguration(
       const OptionsDict& options) override {
     Backend::UpdateConfiguration(options);
@@ -121,6 +124,18 @@ class NetworkAsBackendComputation : public BackendComputation {
 
   void ComputeBlocking() override {
     for (auto& entry : entries_) computation_->AddInput(std::move(entry.input));
+    // Ask for the extra policy heads if any caller wants them. The request has
+    // to happen before the computation runs, and the answer says which heads
+    // the network and backend actually produce.
+    ExtraPolicyHeads wanted;
+    for (const auto& entry : entries_) {
+      if (!entry.result.p_optimistic.empty()) wanted.optimistic = true;
+      if (!entry.result.p_soft.empty()) wanted.soft = true;
+      if (wanted.optimistic && wanted.soft) break;
+    }
+    const ExtraPolicyHeads produced =
+        wanted.Any() ? computation_->RequestExtraPolicyHeads(wanted)
+                     : ExtraPolicyHeads{};
     computation_->ComputeBlocking();
     LCTRACE_FUNCTION_SCOPE;
     for (size_t i = 0; i < entries_.size(); ++i) {
@@ -128,12 +143,31 @@ class NetworkAsBackendComputation : public BackendComputation {
       if (result.q) *result.q = computation_->GetQVal(i);
       if (result.d) *result.d = computation_->GetDVal(i);
       if (result.m) *result.m = computation_->GetMVal(i);
-      if (!result.p.empty()) SoftmaxPolicy(result.p, computation_.get(), i);
+      if (!result.p.empty()) {
+        SoftmaxPolicy(result.p, computation_.get(), i,
+                      [](const NetworkComputation* c, int idx, int move_idx) {
+                        return c->GetPVal(idx, move_idx);
+                      });
+      }
+      if (produced.optimistic && !result.p_optimistic.empty()) {
+        SoftmaxPolicy(result.p_optimistic, computation_.get(), i,
+                      [](const NetworkComputation* c, int idx, int move_idx) {
+                        return c->GetPValOptimistic(idx, move_idx);
+                      });
+      }
+      if (produced.soft && !result.p_soft.empty()) {
+        SoftmaxPolicy(result.p_soft, computation_.get(), i,
+                      [](const NetworkComputation* c, int idx, int move_idx) {
+                        return c->GetPValSoft(idx, move_idx);
+                      });
+      }
     }
   }
 
+  template <typename GetPolicyValue>
   void SoftmaxPolicy(std::span<float> dst,
-                     const NetworkComputation* computation, int idx) {
+                     const NetworkComputation* computation, int idx,
+                     GetPolicyValue get_p) {
     LCTRACE_FUNCTION_SCOPE;
     const std::vector<Move>& moves = entries_[idx].legal_moves;
     const int transform = entries_[idx].transform;
@@ -141,8 +175,9 @@ class NetworkAsBackendComputation : public BackendComputation {
     const float max_p = std::accumulate(
         moves.begin(), moves.end(), -std::numeric_limits<float>::infinity(),
         [&, counter = 0](float max_p, const Move& move) mutable {
-          return std::max(max_p, dst[counter++] = computation->GetPVal(
-                                     idx, MoveToNNIndex(move, transform)));
+          return std::max(max_p, dst[counter++] = get_p(computation, idx,
+                                                        MoveToNNIndex(
+                                                            move, transform)));
         });
     // Compute the softmax and compute the total.
     const float temperature = backend_->softmax_policy_temperature_;

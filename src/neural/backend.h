@@ -54,6 +54,11 @@ struct EvalResultPtr {
   float* d = nullptr;
   float* m = nullptr;
   std::span<float> p = {};
+  // Extra policy heads of a multihead network, for search-side prior
+  // blending. Left empty unless the caller asked for them, and filled only if
+  // the network and the backend both expose them.
+  std::span<float> p_optimistic = {};
+  std::span<float> p_soft = {};
 };
 
 struct EvalResult {
@@ -61,9 +66,16 @@ struct EvalResult {
   float d;
   float m;
   std::vector<float> p;
+  std::vector<float> p_optimistic;
+  std::vector<float> p_soft;
 
   EvalResultPtr AsPtr() {
-    return EvalResultPtr{.q = &q, .d = &d, .m = &m, .p = p};
+    return EvalResultPtr{.q = &q,
+                         .d = &d,
+                         .m = &m,
+                         .p = p,
+                         .p_optimistic = p_optimistic,
+                         .p_soft = p_soft};
   }
 };
 
@@ -91,6 +103,10 @@ class Backend {
   virtual ~Backend() = default;
   virtual BackendAttributes GetAttributes() const = 0;
   virtual std::unique_ptr<BackendComputation> CreateComputation() = 0;
+  // Extra policy heads this backend can fill in EvalResultPtr. Callers must
+  // leave the corresponding spans empty for heads that are not listed here,
+  // otherwise they would read uninitialized memory.
+  virtual ExtraPolicyHeads SupportedExtraPolicyHeads() const { return {}; }
 
   // Simple helper with default implementation, to evaluate a batch without
   // creating a computation explicitly.

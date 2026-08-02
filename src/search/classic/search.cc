@@ -1466,6 +1466,12 @@ void SearchWorker::ProcessPickedTask(int start_idx, int end_idx,
                        std::back_inserter(legal_moves),
                        [](const auto& edge) { return edge.GetMove(); });
         picked_node.eval->p.resize(legal_moves.size());
+        if (blend_heads_.optimistic) {
+          picked_node.eval->p_optimistic.resize(legal_moves.size());
+        }
+        if (blend_heads_.soft) {
+          picked_node.eval->p_soft.resize(legal_moves.size());
+        }
         picked_node.is_cache_hit = computation_->AddInput(
                                        EvalPosition{
                                            .pos = history.GetPositions(),
@@ -2156,6 +2162,129 @@ void SearchWorker::FetchMinibatchResults() {
   }
 }
 
+// Writes the search prior into the node's edges.
+//
+// With every blend option at its default this is the plain copy of the
+// backend's policy vector that stock lc0 does, edge for edge, so priors stay
+// bit-identical to an unpatched build.
+//
+// When enabled, the prior becomes a mixture of normalized distributions
+//   P = w_v * P_vanilla + w_o * P_optimistic + w_s * P_soft   (w_v = 1-w_o-w_s)
+// optionally followed by the single-head dual-temperature lift
+//   P <- (1 - w_dt) * P + w_dt * normalize(P^(PST/T_soft)).
+// Both act on the distribution the backend already softmaxed at
+// PolicySoftmaxTemp, which is where a prior blend belongs: raising that
+// distribution to the power PST/T is identical to softmaxing the raw logits
+// at temperature T, so "before PST" and "after PST with a corrected
+// exponent" are the same function of the network output.
+//
+// Weights are chosen per node class: the root uses the plain options, nodes
+// up to ...MaxPly plies below it use the ...Internal options, and deeper
+// nodes are never blended. Visits at the tip of the principal variation are
+// the product of the per-ply top-move shares, so a tail tax charged at every
+// ply compounds; the depth split is what keeps the lift affordable.
+void SearchWorker::SetEdgePriors(NodeToProcess* node_to_process) {
+  Node* node = node_to_process->node;
+  const std::vector<float>& p = node_to_process->eval->p;
+  const bool is_root = node == search_->root_node_;
+  // moves_to_visit holds the path from the root, so its length is the ply
+  // distance of this node from the root (empty, i.e. 0, at the root).
+  const int ply = static_cast<int>(node_to_process->moves_to_visit.size());
+
+  float w_dt = 0.0f;
+  if (params_.GetDualTempActive() &&
+      (is_root || ply <= params_.GetDualTempMaxPly())) {
+    w_dt = params_.GetDualTempSoftWeight(is_root);
+  }
+  const bool blend_ply = is_root || ply <= params_.GetPolicyBlendMaxPly();
+  const size_t n_edges = p.size();
+  float w_o = 0.0f;
+  if (blend_heads_.optimistic && blend_ply &&
+      node_to_process->eval->p_optimistic.size() == n_edges) {
+    w_o = params_.GetPolicyBlendOptimisticWeight(is_root);
+  }
+  float w_s = 0.0f;
+  if (blend_heads_.soft && blend_ply &&
+      node_to_process->eval->p_soft.size() == n_edges) {
+    w_s = params_.GetPolicyBlendSoftWeight(is_root);
+  }
+
+  if (w_dt <= 0.0f && w_o <= 0.0f && w_s <= 0.0f) {
+    for (size_t p_idx = 0; auto& edge : node->Edges()) {
+      edge.edge()->SetP(p[p_idx++]);
+    }
+    return;
+  }
+
+  // Scratch buffers. thread_local rather than SearchWorker members because
+  // this runs both on the search thread (through FetchMinibatchResults) and on
+  // task workers (out-of-order evaluation).
+  thread_local std::vector<float> blended;
+  blended.assign(p.begin(), p.end());
+
+  // Head mixture: P = (1 - w_o - w_s) * P_vanilla + w_o * P_opt + w_s * P_soft.
+  // Every term is a normalized distribution, so the result is normalized too
+  // and w_s is literally the share of probability mass the soft head's ordered
+  // tail contributes.
+  if (w_o > 0.0f || w_s > 0.0f) {
+    const float w_v = std::max(0.0f, 1.0f - w_o - w_s);
+    for (size_t i = 0; i < n_edges; ++i) blended[i] = w_v * p[i];
+    if (w_o > 0.0f) {
+      const std::vector<float>& p_opt = node_to_process->eval->p_optimistic;
+      for (size_t i = 0; i < n_edges; ++i) blended[i] += w_o * p_opt[i];
+    }
+    if (w_s > 0.0f) {
+      const std::vector<float>& p_soft = node_to_process->eval->p_soft;
+      const float soft_exponent = params_.GetPolicyBlendSoftExponent();
+      if (soft_exponent == 1.0f) {
+        for (size_t i = 0; i < n_edges; ++i) blended[i] += w_s * p_soft[i];
+      } else {
+        // Re-temper the soft head before mixing it in.
+        thread_local std::vector<float> tempered_soft;
+        tempered_soft.clear();
+        tempered_soft.reserve(n_edges);
+        double soft_sum = 0.0;
+        for (size_t i = 0; i < n_edges; ++i) {
+          const float t = std::pow(p_soft[i], soft_exponent);
+          tempered_soft.push_back(t);
+          soft_sum += t;
+        }
+        const float soft_scale =
+            soft_sum > 0.0 ? static_cast<float>(w_s / soft_sum) : 0.0f;
+        for (size_t i = 0; i < n_edges; ++i) {
+          blended[i] += soft_scale * tempered_soft[i];
+        }
+      }
+    }
+  }
+
+  // Dual-temperature lift of whatever prior we ended up with.
+  if (w_dt > 0.0f) {
+    thread_local std::vector<float> tempered;
+    tempered.clear();
+    tempered.reserve(n_edges);
+    const float exponent = params_.GetDualTempExponent();
+    double sum = 0.0;
+    for (size_t i = 0; i < n_edges; ++i) {
+      const float t = std::pow(blended[i], exponent);
+      tempered.push_back(t);
+      sum += t;
+    }
+    if (sum > 0.0) {
+      const float keep = 1.0f - w_dt;
+      const float scale = static_cast<float>(w_dt / sum);
+      for (size_t i = 0; i < n_edges; ++i) {
+        blended[i] = keep * blended[i] + scale * tempered[i];
+      }
+    }
+  }
+
+  for (size_t p_idx = 0; auto& edge : node->Edges()) {
+    edge.edge()->SetP(blended[p_idx]);
+    ++p_idx;
+  }
+}
+
 void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process) {
   if (node_to_process->IsCollision()) return;
   Node* node = node_to_process->node;
@@ -2184,9 +2313,7 @@ void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process) {
                    : params_.GetWDLRescaleDiff(),
                sign, false, params_.GetWDLMaxS());
   }
-  for (size_t p_idx = 0; auto& edge : node->Edges()) {
-    edge.edge()->SetP(node_to_process->eval->p[p_idx++]);
-  }
+  SetEdgePriors(node_to_process);
   // Add Dirichlet noise if enabled and at root.
   if (params_.GetNoiseEpsilon() && node == search_->root_node_) {
     ApplyDirichletNoise(node, params_.GetNoiseEpsilon(),

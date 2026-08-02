@@ -37,6 +37,24 @@
 namespace lczero {
 namespace cudnn_backend {
 
+// Extra policy heads of a multihead network, indexing the per-head arrays of
+// InputsOutputs and of the network.
+enum ExtraPolicyHeadIndex {
+  kExtraPolicyOptimistic = 0,
+  kExtraPolicySoft = 1,
+  kNumExtraPolicyHeads = 2
+};
+
+// A captured cuda graph contains the kernels of exactly the extra policy heads
+// that were requested when it was captured, so graphs are kept per combination
+// of requested heads as well as per batch size.
+constexpr int kNumExtraPolicyHeadCombos = 1 << kNumExtraPolicyHeads;
+
+inline int ExtraPolicyHeadCombo(ExtraPolicyHeads heads) {
+  return (heads.optimistic ? 1 << kExtraPolicyOptimistic : 0) |
+         (heads.soft ? 1 << kExtraPolicySoft : 0);
+}
+
 inline void ToType(float& dst, float src) { dst = src; }
 inline void ToType(half& dst, float src) {
   auto temp = FP32toFP16(src);
@@ -73,7 +91,8 @@ template <typename DataType>
 struct InputsOutputs {
   InputsOutputs(unsigned maxBatchSize, bool wdl, bool moves_left,
                 size_t tensor_mem_size = 0, size_t scratch_size = 0,
-                bool cublasDisableTensorCores = false) {
+                bool cublasDisableTensorCores = false,
+                ExtraPolicyHeads extra_policy_heads = {}) {
     ReportCUDAErrors(cudaHostAlloc(
         &input_masks_mem_, maxBatchSize * kInputPlanes * sizeof(uint64_t),
         cudaHostAllocMapped));
@@ -98,6 +117,21 @@ struct InputsOutputs {
     ReportCUDAErrors(cudaMalloc(
         &op_policy_mem_gpu_,
         maxBatchSize * kNumOutputPolicy * sizeof(op_policy_mem_[0])));
+
+    // Output of the extra policy heads, one buffer pair per head the network
+    // can produce. Untouched unless a computation asks for the head.
+    const bool wanted[kNumExtraPolicyHeads] = {extra_policy_heads.optimistic,
+                                               extra_policy_heads.soft};
+    for (int i = 0; i < kNumExtraPolicyHeads; i++) {
+      if (!wanted[i]) continue;
+      ReportCUDAErrors(cudaHostAlloc(
+          &op_policy_extra_mem_[i],
+          maxBatchSize * kNumOutputPolicy * sizeof(op_policy_mem_[0]), 0));
+      ReportCUDAErrors(cudaMalloc(
+          &op_policy_extra_mem_gpu_[i],
+          maxBatchSize * kNumOutputPolicy * sizeof(op_policy_mem_[0])));
+    }
+
     ReportCUDAErrors(cudaHostAlloc(
         &op_value_mem_, maxBatchSize * (wdl ? 3 : 1) * sizeof(op_value_mem_[0]),
         cudaHostAllocMapped));
@@ -132,7 +166,12 @@ struct InputsOutputs {
         cudaStreamCreateWithFlags(&exec_stream_, cudaStreamNonBlocking));
     ReportCUDAErrors(
         cudaEventCreateWithFlags(&join_capture_event_, cudaEventDisableTiming));
-    cuda_graphs_ = std::make_unique<CudaGraphExec<DataType>[]>(maxBatchSize);
+    for (int combo = 0; combo < kNumExtraPolicyHeadCombos; combo++) {
+      // Only the plain combo is reachable unless the network has extra heads.
+      if (combo != 0 && !extra_policy_heads.Any()) break;
+      cuda_graphs_[combo] =
+          std::make_unique<CudaGraphExec<DataType>[]>(maxBatchSize);
+    }
 
     // memory for network execution managed inside this structure
     if (tensor_mem_size) {
@@ -165,6 +204,11 @@ struct InputsOutputs {
     ReportCUDAErrors(cudaFree(input_val_mem_gpu_));
     ReportCUDAErrors(cudaFreeHost(op_policy_mem_));
     ReportCUDAErrors(cudaFree(op_policy_mem_gpu_));
+    for (int i = 0; i < kNumExtraPolicyHeads; i++) {
+      if (op_policy_extra_mem_[i] == nullptr) continue;
+      ReportCUDAErrors(cudaFreeHost(op_policy_extra_mem_[i]));
+      ReportCUDAErrors(cudaFree(op_policy_extra_mem_gpu_[i]));
+    }
     ReportCUDAErrors(cudaFreeHost(op_value_mem_));
     ReportCUDAErrors(cudaFree(op_value_mem_gpu_));
     ReportCUDAErrors(cudaEventDestroy(upload_done_event_));
@@ -189,6 +233,9 @@ struct InputsOutputs {
       if (head_offset_pointers_) {
         ReportCUDAErrors(cudaFree(head_offset_pointers_));
       }
+      for (auto ptrs : extra_head_offset_pointers_) {
+        if (ptrs) ReportCUDAErrors(cudaFree(ptrs));
+      }
       ReportCUDAErrors(cudaStreamDestroy(compute_stream_));
       ReportCUDAErrors(cudaStreamDestroy(upload_stream_));
       ReportCUDAErrors(cudaStreamDestroy(download_stream_));
@@ -200,6 +247,8 @@ struct InputsOutputs {
   DataType* op_policy_mem_;
   DataType* op_value_mem_;
   DataType* op_moves_left_mem_ = nullptr;
+  // Indexed by ExtraPolicyHeadIndex; null for heads the network cannot make.
+  DataType* op_policy_extra_mem_[kNumExtraPolicyHeads] = {};
 
   // Copies in VRAM.
   uint64_t* input_masks_mem_gpu_;
@@ -207,6 +256,7 @@ struct InputsOutputs {
   DataType* op_policy_mem_gpu_;
   DataType* op_value_mem_gpu_;
   DataType* op_moves_left_mem_gpu_ = nullptr;
+  DataType* op_policy_extra_mem_gpu_[kNumExtraPolicyHeads] = {};
 
   std::unique_ptr<float[]> wdl_cpu_softmax_;
 
@@ -217,6 +267,9 @@ struct InputsOutputs {
   void* scratch_mem_;
   void** offset_pointers_ = nullptr;
   void** head_offset_pointers_ = nullptr;
+  // The extra heads keep their own, because their policy encoder blocks may
+  // differ in shape from the selected head's.
+  void** extra_head_offset_pointers_[kNumExtraPolicyHeads] = {};
 
   // cuda stream used to run the network
   cudaStream_t compute_stream_ = nullptr;
@@ -231,9 +284,11 @@ struct InputsOutputs {
   cudaEvent_t wdl_download_done_event_ = nullptr;
   cudaEvent_t download_done_event_ = nullptr;
 
-  // cuda graph support
+  // cuda graph support, one array of per-batch-size graphs per combination of
+  // requested extra policy heads (see ExtraPolicyHeadCombo).
   cudaStream_t exec_stream_ = nullptr;
-  std::unique_ptr<CudaGraphExec<DataType>[]> cuda_graphs_;
+  std::unique_ptr<CudaGraphExec<DataType>[]>
+      cuda_graphs_[kNumExtraPolicyHeadCombos];
   cudaEvent_t join_capture_event_ = nullptr;
 
   // cublas handle used to run the network
