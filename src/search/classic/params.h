@@ -144,6 +144,10 @@ class BaseSearchParams {
     return kPolicyBlendSoftTemp > 0.0f ? kPolicySoftmaxTemp / kPolicyBlendSoftTemp
                                        : 1.0f;
   }
+  // Pool the heads geometrically rather than arithmetically. Since log(p)
+  // recovers each head's logits up to a move-independent constant, this is
+  // exactly what mixing the logits before the softmax would produce.
+  bool GetPolicyBlendGeometric() const { return kPolicyBlendGeometric; }
   int GetMaxCollisionEvents() const { return kMaxCollisionEvents; }
   int GetMaxCollisionVisits() const { return kMaxCollisionVisits; }
   bool GetOutOfOrderEval() const { return kOutOfOrderEval; }
@@ -292,6 +296,7 @@ class BaseSearchParams {
   static const OptionId kPolicyBlendSoftWeightInternalId;
   static const OptionId kPolicyBlendSoftTempId;
   static const OptionId kPolicyBlendMaxPlyId;
+  static const OptionId kPolicyBlendGeometricId;
 
  protected:
   const OptionsDict& options_;
@@ -361,6 +366,7 @@ class BaseSearchParams {
   const float kPolicyBlendSoftWeightInternal;
   const float kPolicyBlendSoftTemp;
   const int kPolicyBlendMaxPly;
+  const bool kPolicyBlendGeometric;
 };
 
 class SearchParams : public BaseSearchParams {

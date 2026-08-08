@@ -2137,6 +2137,51 @@ void SearchWorker::FetchMinibatchResults() {
   }
 }
 
+namespace {
+// Log-linear (geometric) pooling of the heads:
+//   P ~ P_vanilla^w_v * P_optimistic^w_o * P_soft^w_s
+// computed in log space and renormalized, writing the result over p.
+//
+// Because log(p) recovers a head's logits up to a move-independent constant,
+// this is exactly the distribution that mixing the logits *before* the softmax
+// would produce -- and so, unlike the arithmetic mixture, it is something a
+// single head conditioned on an optimism input could itself represent.
+//
+// The two rules differ in kind, not degree. Arithmetic pooling is a union: a
+// move only needs one head to like it, since P >= w_h * p_h. Geometric pooling
+// is an intersection: a move any head considers hopeless stays hopeless
+// whatever the others say.
+//
+// A zero prior sends the log to -inf, so the inputs are floored; the floor also
+// decides how hard a veto is. Exponents sum to 1 whenever the soft head is not
+// separately re-tempered, which keeps the pooling scale-free -- with
+// PolicyBlendSoftTemp set they do not, and the surplus acts as a temperature.
+void GeometricBlend(std::vector<float>& p, const std::vector<float>& p_opt,
+                    const std::vector<float>& p_soft, float w_v, float w_o,
+                    float w_s) {
+  constexpr float kFloor = 1e-9f;
+  thread_local std::vector<float> acc;
+  acc.clear();
+  acc.reserve(p.size());
+  float max_log = 0.0f;
+  for (size_t i = 0; i < p.size(); ++i) {
+    float l = 0.0f;
+    if (w_v > 0.0f) l += w_v * std::log(std::max(p[i], kFloor));
+    if (w_o > 0.0f) l += w_o * std::log(std::max(p_opt[i], kFloor));
+    if (w_s > 0.0f) l += w_s * std::log(std::max(p_soft[i], kFloor));
+    acc.push_back(l);
+    if (i == 0 || l > max_log) max_log = l;
+  }
+  double sum = 0.0;
+  for (auto& v : acc) {
+    v = std::exp(v - max_log);
+    sum += v;
+  }
+  const float scale = sum > 0.0 ? static_cast<float>(1.0 / sum) : 0.0f;
+  for (size_t i = 0; i < p.size(); ++i) p[i] = acc[i] * scale;
+}
+}  // namespace
+
 // Mixes the extra policy heads into the prior before it is written to the
 // node, in place in the eval's policy vector.
 //
@@ -2197,6 +2242,15 @@ void SearchWorker::BlendPolicy(NodeToProcess* node_to_process) {
     w_s /= w_sum;
   }
   const float w_v = std::max(0.0f, 1.0f - w_o - w_s);
+  if (params_.GetPolicyBlendGeometric()) {
+    // The soft head's own exponent folds straight into its pooling weight
+    // here, and the renormalization it would need is absorbed by the final
+    // one, so the arithmetic path's separate re-tempering is not required.
+    GeometricBlend(p, node_to_process->eval->p_optimistic,
+                   node_to_process->eval->p_soft, w_v, w_o,
+                   w_s * params_.GetPolicyBlendSoftExponent());
+    return;
+  }
   for (size_t i = 0; i < n_edges; ++i) p[i] *= w_v;
   if (w_o > 0.0f) {
     const std::vector<float>& p_opt = node_to_process->eval->p_optimistic;

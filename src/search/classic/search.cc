@@ -2162,6 +2162,51 @@ void SearchWorker::FetchMinibatchResults() {
   }
 }
 
+namespace {
+// Log-linear (geometric) pooling of the heads:
+//   P ~ P_vanilla^w_v * P_optimistic^w_o * P_soft^w_s
+// computed in log space and renormalized, writing the result over p.
+//
+// Because log(p) recovers a head's logits up to a move-independent constant,
+// this is exactly the distribution that mixing the logits *before* the softmax
+// would produce -- and so, unlike the arithmetic mixture, it is something a
+// single head conditioned on an optimism input could itself represent.
+//
+// The two rules differ in kind, not degree. Arithmetic pooling is a union: a
+// move only needs one head to like it, since P >= w_h * p_h. Geometric pooling
+// is an intersection: a move any head considers hopeless stays hopeless
+// whatever the others say.
+//
+// A zero prior sends the log to -inf, so the inputs are floored; the floor also
+// decides how hard a veto is. Exponents sum to 1 whenever the soft head is not
+// separately re-tempered, which keeps the pooling scale-free -- with
+// PolicyBlendSoftTemp set they do not, and the surplus acts as a temperature.
+void GeometricBlend(std::vector<float>& p, const std::vector<float>& p_opt,
+                    const std::vector<float>& p_soft, float w_v, float w_o,
+                    float w_s) {
+  constexpr float kFloor = 1e-9f;
+  thread_local std::vector<float> acc;
+  acc.clear();
+  acc.reserve(p.size());
+  float max_log = 0.0f;
+  for (size_t i = 0; i < p.size(); ++i) {
+    float l = 0.0f;
+    if (w_v > 0.0f) l += w_v * std::log(std::max(p[i], kFloor));
+    if (w_o > 0.0f) l += w_o * std::log(std::max(p_opt[i], kFloor));
+    if (w_s > 0.0f) l += w_s * std::log(std::max(p_soft[i], kFloor));
+    acc.push_back(l);
+    if (i == 0 || l > max_log) max_log = l;
+  }
+  double sum = 0.0;
+  for (auto& v : acc) {
+    v = std::exp(v - max_log);
+    sum += v;
+  }
+  const float scale = sum > 0.0 ? static_cast<float>(1.0 / sum) : 0.0f;
+  for (size_t i = 0; i < p.size(); ++i) p[i] = acc[i] * scale;
+}
+}  // namespace
+
 // Writes the search prior into the node's edges.
 //
 // With every blend option at its default this is the plain copy of the
@@ -2238,31 +2283,40 @@ void SearchWorker::SetEdgePriors(NodeToProcess* node_to_process) {
       w_s /= w_sum;
     }
     const float w_v = std::max(0.0f, 1.0f - w_o - w_s);
-    for (size_t i = 0; i < n_edges; ++i) blended[i] = w_v * p[i];
-    if (w_o > 0.0f) {
-      const std::vector<float>& p_opt = node_to_process->eval->p_optimistic;
-      for (size_t i = 0; i < n_edges; ++i) blended[i] += w_o * p_opt[i];
-    }
-    if (w_s > 0.0f) {
-      const std::vector<float>& p_soft = node_to_process->eval->p_soft;
-      const float soft_exponent = params_.GetPolicyBlendSoftExponent();
-      if (soft_exponent == 1.0f) {
-        for (size_t i = 0; i < n_edges; ++i) blended[i] += w_s * p_soft[i];
-      } else {
-        // Re-temper the soft head before mixing it in.
-        thread_local std::vector<float> tempered_soft;
-        tempered_soft.clear();
-        tempered_soft.reserve(n_edges);
-        double soft_sum = 0.0;
-        for (size_t i = 0; i < n_edges; ++i) {
-          const float t = std::pow(p_soft[i], soft_exponent);
-          tempered_soft.push_back(t);
-          soft_sum += t;
-        }
-        const float soft_scale =
-            soft_sum > 0.0 ? static_cast<float>(w_s / soft_sum) : 0.0f;
-        for (size_t i = 0; i < n_edges; ++i) {
-          blended[i] += soft_scale * tempered_soft[i];
+    if (params_.GetPolicyBlendGeometric()) {
+      // blended already holds the vanilla prior. The soft head's own exponent
+      // folds straight into its pooling weight, and the renormalization it
+      // would need is absorbed by the final one.
+      GeometricBlend(blended, node_to_process->eval->p_optimistic,
+                     node_to_process->eval->p_soft, w_v, w_o,
+                     w_s * params_.GetPolicyBlendSoftExponent());
+    } else {
+      for (size_t i = 0; i < n_edges; ++i) blended[i] = w_v * p[i];
+      if (w_o > 0.0f) {
+        const std::vector<float>& p_opt = node_to_process->eval->p_optimistic;
+        for (size_t i = 0; i < n_edges; ++i) blended[i] += w_o * p_opt[i];
+      }
+      if (w_s > 0.0f) {
+        const std::vector<float>& p_soft = node_to_process->eval->p_soft;
+        const float soft_exponent = params_.GetPolicyBlendSoftExponent();
+        if (soft_exponent == 1.0f) {
+          for (size_t i = 0; i < n_edges; ++i) blended[i] += w_s * p_soft[i];
+        } else {
+          // Re-temper the soft head before mixing it in.
+          thread_local std::vector<float> tempered_soft;
+          tempered_soft.clear();
+          tempered_soft.reserve(n_edges);
+          double soft_sum = 0.0;
+          for (size_t i = 0; i < n_edges; ++i) {
+            const float t = std::pow(p_soft[i], soft_exponent);
+            tempered_soft.push_back(t);
+            soft_sum += t;
+          }
+          const float soft_scale =
+              soft_sum > 0.0 ? static_cast<float>(w_s / soft_sum) : 0.0f;
+          for (size_t i = 0; i < n_edges; ++i) {
+            blended[i] += soft_scale * tempered_soft[i];
+          }
         }
       }
     }

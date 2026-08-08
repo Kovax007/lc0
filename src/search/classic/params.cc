@@ -589,6 +589,18 @@ const OptionId BaseSearchParams::kPolicyBlendMaxPlyId{
     "PolicyBlend...Internal weights are applied. The root itself (ply 0) "
     "always uses the non-Internal weights. 0 means blend at the root "
     "only."};
+const OptionId BaseSearchParams::kPolicyBlendGeometricId{
+    "policy-blend-geometric", "PolicyBlendGeometric",
+    "Pool the policy heads geometrically instead of arithmetically: P is "
+    "proportional to the product of each head's prior raised to its weight. "
+    "Since log(p) recovers a head's logits up to a move-independent "
+    "constant, this is exactly what mixing the logits before the softmax "
+    "would give. Unlike the arithmetic mixture it is a consensus rule -- a "
+    "move any head considers hopeless stays hopeless, instead of being "
+    "carried by the one head that likes it -- and it is the only one of the "
+    "two that a single network head conditioned on an optimism input could "
+    "itself represent. Weights keep their meaning and the result is "
+    "renormalized. False (default) keeps the arithmetic mixture."};
 
 const OptionId SearchParams::kMaxPrefetchBatchId{
     "max-prefetch", "MaxPrefetch",
@@ -703,6 +715,7 @@ void BaseSearchParams::Populate(OptionsParser* options) {
       0.0f;
   options->Add<FloatOption>(kPolicyBlendSoftTempId, 0.0f, 20.0f) = 0.0f;
   options->Add<IntOption>(kPolicyBlendMaxPlyId, 0, 99) = 0;
+  options->Add<BoolOption>(kPolicyBlendGeometricId) = false;
 }
 
 void SearchParams::Populate(OptionsParser* options) {
@@ -811,7 +824,8 @@ BaseSearchParams::BaseSearchParams(const OptionsDict& options)
       kPolicyBlendSoftWeightInternal(
           options_.Get<float>(kPolicyBlendSoftWeightInternalId)),
       kPolicyBlendSoftTemp(options_.Get<float>(kPolicyBlendSoftTempId)),
-      kPolicyBlendMaxPly(options_.Get<int>(kPolicyBlendMaxPlyId)) {}
+      kPolicyBlendMaxPly(options_.Get<int>(kPolicyBlendMaxPlyId)),
+      kPolicyBlendGeometric(options_.Get<bool>(kPolicyBlendGeometricId)) {}
 
 SearchParams::SearchParams(const OptionsDict& options)
     : BaseSearchParams(options),
