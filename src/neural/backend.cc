@@ -60,6 +60,12 @@ uint64_t Backend::ConfigurationHash(const OptionsDict& options) const {
                            SharedBackendParams::kWeightsId)));
   hash = HashCat(hash, std::hash<float>{}(options.Get<float>(
                            SharedBackendParams::kPolicySoftmaxTemp)));
+  // The blend happens before the prior is cached, so two configurations that
+  // differ only in these weights are as different as two temperatures are.
+  hash = HashCat(hash, std::hash<float>{}(options.Get<float>(
+                           SharedBackendParams::kPolicyBlendOptimistic)));
+  hash = HashCat(hash, std::hash<float>{}(options.Get<float>(
+                           SharedBackendParams::kPolicyBlendSoft)));
   hash = HashCat(hash, std::hash<std::string>{}(options.Get<std::string>(
                            SharedBackendParams::kHistoryFill)));
   return hash;

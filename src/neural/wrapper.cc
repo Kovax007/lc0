@@ -221,6 +221,24 @@ std::unique_ptr<Backend> NetworkAsBackendFactory::Create(
   OptionsDict network_options;
   network_options.AddSubdictFromString(backend_options);
 
+  // Which policy heads a backend blend evaluates has to be settled before the
+  // network builds anything, so a weight given as a UCI option has to arrive
+  // with the backend options rather than after them. Written under the backend
+  // option's own key, which also gives the documented precedence for free: a
+  // weight set here wins, and leaving it at zero falls back to the backend
+  // option. A backend that does not know the key still refuses to load, which
+  // is the honest answer to a blend it cannot perform.
+  const float blend_optimistic =
+      options.Get<float>(SharedBackendParams::kPolicyBlendOptimistic);
+  if (blend_optimistic > 0.0f) {
+    network_options.Set<float>("policy_blend_optimistic", blend_optimistic);
+  }
+  const float blend_soft =
+      options.Get<float>(SharedBackendParams::kPolicyBlendSoft);
+  if (blend_soft > 0.0f) {
+    network_options.Set<float>("policy_blend_soft", blend_soft);
+  }
+
   std::string net_path =
       options.Get<std::string>(SharedBackendParams::kWeightsId);
   std::optional<WeightsFile> weights = LoadWeights(net_path);

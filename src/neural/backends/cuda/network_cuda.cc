@@ -429,16 +429,24 @@ class CudaNetwork : public Network {
     // what leaves the backend is one policy vector, indistinguishable from an
     // unblended one to everything downstream.
     //
+    // The weights arrive here whether they were written as backend options or
+    // as the BackendPolicyBlend* UCI options, which the backend factory folds
+    // into these same keys before the network is built -- they have to be
+    // known now, since a head that is not wired in here is not evaluated for
+    // the lifetime of the network.
+    //
     // The backend-opts lexer sorts `1` into the integer dictionary and `0.55`
     // into the float one, so reading a weight as a float only would silently
-    // ignore any whole-number value. Look in both, which also leaves the option
-    // marked as read whichever way it was written.
+    // ignore any whole-number value. Both dictionaries are read and the float
+    // wins, which is also the precedence the UCI option needs: it is written
+    // as a float on top of whatever the backend options said. Reading both
+    // also leaves the key marked as read either way, and an unread key is a
+    // hard error.
     auto blend_weight = [&options](const char* key) {
-      if (options.Exists<float>(key)) return options.Get<float>(key);
-      if (options.Exists<int>(key)) {
-        return static_cast<float>(options.Get<int>(key));
-      }
-      return 0.0f;
+      float weight = 0.0f;
+      if (options.Exists<int>(key)) weight = options.Get<int>(key);
+      if (options.Exists<float>(key)) weight = options.Get<float>(key);
+      return weight;
     };
     blend_w_extra_[kExtraPolicyOptimistic] =
         blend_weight("policy_blend_optimistic");
@@ -481,6 +489,11 @@ class CudaNetwork : public Network {
       blend_w_main_ =
           std::max(0.0f, 1.0f - blend_w_extra_[kExtraPolicyOptimistic] -
                              blend_w_extra_[kExtraPolicySoft]);
+      // Which heads take part is a separate question from what they weigh, and
+      // is answered once, here. A head stays in the blend however small its
+      // weight is, so that moving the weight cannot move the cost of a search
+      // -- a tuner reading Elo off these weights must not be reading a speed
+      // difference as well.
       blend_heads_.optimistic = blend_w_extra_[kExtraPolicyOptimistic] > 0.0f;
       blend_heads_.soft = blend_w_extra_[kExtraPolicySoft] > 0.0f;
     }
@@ -1107,9 +1120,15 @@ class CudaNetwork : public Network {
         // Folding the heads together here, before the policy output is copied
         // out, is what keeps the rest of the engine on its vanilla path: one
         // download, one softmax, one prior per position.
+        //
+        // Keyed on which heads take part rather than on what they weigh: the
+        // two answers coincide today, but the run set above and this one have
+        // to be the same set or a head would be evaluated and then discarded.
+        const bool pooled[kNumExtraPolicyHeads] = {blend_heads_.optimistic,
+                                                   blend_heads_.soft};
         const DataType* blended[kNumExtraPolicyHeads] = {};
         for (int i = 0; i < kNumExtraPolicyHeads; i++) {
-          if (blend_w_extra_[i] > 0.0f) {
+          if (pooled[i]) {
             blended[i] = (const DataType*)io->op_policy_extra_mem_gpu_[i];
           }
         }

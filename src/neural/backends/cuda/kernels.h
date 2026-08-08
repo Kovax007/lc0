@@ -41,7 +41,7 @@ void addVectors(T* c, T* a, T* b, int size, int asize, int bsize,
 
 // Geometric pooling of the policy heads, as a weighted sum of their logits
 // written over the first vector. A null head pointer drops that term, which is
-// how a head with zero weight is never even evaluated.
+// how a head that is not part of the blend is never even evaluated.
 template <typename T>
 void blendPolicyLogits(T* main, const T* opt, const T* soft, float w_main,
                        float w_opt, float w_soft, int count,

@@ -34,6 +34,30 @@ const OptionId SharedBackendParams::kPolicySoftmaxTemp{
     "policy-softmax-temp", "PolicyTemperature",
     "Policy softmax temperature. Higher values make priors of move candidates "
     "closer to each other, widening the search."};
+// Deliberately named apart from the search-side PolicyBlend* parameters: these
+// two reach the backend's own pooling of the policy heads, and a tuning harness
+// that confused the two would silently measure the wrong engine.
+const OptionId SharedBackendParams::kPolicyBlendOptimistic{
+    "backend-policy-blend-optimistic", "BackendPolicyBlendOptimistic",
+    "Weight of the optimistic policy head where the backend pools the policy "
+    "heads itself, geometrically and before the softmax. Read once, when the "
+    "backend is constructed -- which is at the first search, after the "
+    "setoption commands an engine is given at startup, but not again after "
+    "that, so changing it later has no effect until the backend is rebuilt. "
+    "Zero leaves the weight to the backend option policy_blend_optimistic; "
+    "any value above zero overrides it. The head is evaluated if either of "
+    "the two is above zero, and goes on being evaluated however small the "
+    "weight becomes, so what a search costs does not depend on where the "
+    "weight sits -- which is what makes the weight tunable against Elo alone. "
+    "Cuda backends only."};
+const OptionId SharedBackendParams::kPolicyBlendSoft{
+    "backend-policy-blend-soft", "BackendPolicyBlendSoft",
+    "Weight of the soft policy head in the backend's own pooling of the policy "
+    "heads. When it is read, what zero means and how it decides which heads "
+    "are evaluated are as described for BackendPolicyBlendOptimistic. If the "
+    "two weights sum to more than one they are scaled down to sum to one, so "
+    "the pooling stays a weighted mean rather than turning into a "
+    "temperature."};
 const OptionId SharedBackendParams::kHistoryFill{
     "history-fill", "HistoryFill",
     "Neural network uses 7 previous board positions in addition to the current "
@@ -67,6 +91,8 @@ const OptionId SharedBackendParams::kNNCacheSizeId{
 
 void SharedBackendParams::Populate(OptionsParser* options) {
   options->Add<FloatOption>(kPolicySoftmaxTemp, 0.1f, 10.0f) = 1.359f;
+  options->Add<FloatOption>(kPolicyBlendOptimistic, 0.0f, 1.0f) = 0.0f;
+  options->Add<FloatOption>(kPolicyBlendSoft, 0.0f, 1.0f) = 0.0f;
   std::vector<std::string> history_fill_opt{"no", "fen_only", "always"};
   options->Add<ChoiceOption>(kHistoryFill, history_fill_opt) = "fen_only";
 
