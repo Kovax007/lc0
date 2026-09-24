@@ -809,13 +809,22 @@ void Lc0exCudaBackendComputation::ComputeBlocking() {
   const ProgramSpec& program =
       split ? *split->first : backend_->FindProgram(actual_batch);
 
-  std::vector<std::uint64_t> masks(actual_batch * kInputPlanes);
-  std::vector<float> values(actual_batch * kInputPlanes);
-  for (std::size_t sample = 0; sample < actual_batch; ++sample) {
+  // A batch between rungs runs the next rung's program. Its padding slots must
+  // hold real positions: left unset they keep whatever the planner last put in
+  // that memory, which decodes as boards full of pieces -- their edge lists
+  // overflow and every block takes the exact dense fallback for them (b65 on a
+  // 128 rung: 15.0 ms instead of 11.6). Copies of the last position cost what a
+  // real position costs.
+  const std::size_t padded_batch =
+      split ? split->first_count + split->second->batch_size
+            : program.batch_size;
+  std::vector<std::uint64_t> masks(padded_batch * kInputPlanes);
+  std::vector<float> values(padded_batch * kInputPlanes);
+  for (std::size_t sample = 0; sample < padded_batch; ++sample) {
     const std::size_t offset = sample * kInputPlanes;
-    std::copy(entries_[sample].masks.begin(), entries_[sample].masks.end(),
-              masks.begin() + offset);
-    std::copy(entries_[sample].values.begin(), entries_[sample].values.end(),
+    const auto& entry = entries_[std::min(sample, actual_batch - 1)];
+    std::copy(entry.masks.begin(), entry.masks.end(), masks.begin() + offset);
+    std::copy(entry.values.begin(), entry.values.end(),
               values.begin() + offset);
   }
 
@@ -841,15 +850,16 @@ void Lc0exCudaBackendComputation::ComputeBlocking() {
                            &backend_->execution_slot_pool_);
     const auto part = [&](const ProgramSpec& spec, std::size_t offset,
                           std::size_t count) {
-      lc0ex::Execution& execution = backend_->GetExecution(permit.index(), spec);
+      lc0ex::Execution& execution =
+          backend_->GetExecution(permit.index(), spec);
       execution.GetBuffer(*spec.input_masks)
-          .CopyFromHostAsync(mask_bytes.subspan(offset * kInputPlanes *
-                                                sizeof(std::uint64_t)),
-                             count * kInputPlanes * sizeof(std::uint64_t));
+          .CopyFromHostAsync(
+              mask_bytes.subspan(offset * kInputPlanes * sizeof(std::uint64_t)),
+              spec.batch_size * kInputPlanes * sizeof(std::uint64_t));
       execution.GetBuffer(*spec.input_values)
           .CopyFromHostAsync(
               value_bytes.subspan(offset * kInputPlanes * sizeof(float)),
-              count * kInputPlanes * sizeof(float));
+              spec.batch_size * kInputPlanes * sizeof(float));
       execution.Run();
       execution.GetBuffer(*spec.output_policy)
           .CopyToHostAsync(
