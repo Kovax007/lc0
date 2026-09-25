@@ -4,6 +4,7 @@
 .DS_Store
 .cache/
 .clangd/
+.juggler/
 build/
 builddir/
 __pycache__/

@@ -31,6 +31,7 @@
 #include "search/register.h"
 #include "selfplay/loop.h"
 #include "tools/backendbench.h"
+#include "tools/backendcompare.h"
 #include "tools/benchmark.h"
 #include "tools/describenet.h"
 #include "tools/leela2onnx.h"
@@ -96,6 +97,8 @@ int main(int argc, const char** argv) {
       CommandLine::RegisterMode("bench", "Very quick benchmark");
       CommandLine::RegisterMode("backendbench",
                                 "Quick benchmark of backend only");
+      CommandLine::RegisterMode("backendcompare",
+                                "Fidelity comparison of two backends");
       CommandLine::RegisterMode("leela2onnx", "Convert Leela network to ONNX.");
       CommandLine::RegisterMode("onnx2leela",
                                 "Convert ONNX network to Leela net.");
@@ -126,6 +129,10 @@ int main(int argc, const char** argv) {
       // Backend Benchmark mode.
       BackendBenchmark benchmark;
       benchmark.Run();
+    } else if (CommandLine::ConsumeCommand("backendcompare")) {
+      // Backend fidelity comparison mode.
+      BackendCompare compare;
+      compare.Run();
     } else if (CommandLine::ConsumeCommand("leela2onnx")) {
       lczero::ConvertLeelaToOnnx();
     } else if (CommandLine::ConsumeCommand("onnx2leela")) {
