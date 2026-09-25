@@ -322,6 +322,66 @@ class SearchParams : public BaseSearchParams {
   float GetTemperatureSimulatedCpuct() const {
     return options_.Get<float>(kTemperatureSimulatedCpuctId);
   }
+  bool UsePolicyTargetGrill9() const {
+    return options_.Get<bool>(kUsePolicyTargetGrill9Id);
+  }
+  float GetGrill9AtanhScale() const {
+    return options_.Get<float>(kGrill9AtanhScaleId);
+  }
+  float GetGrill9VisitBlend() const {
+    return options_.Get<float>(kGrill9VisitBlendId);
+  }
+  bool PolicyTargetPruneForced() const {
+    return options_.Get<bool>(kPolicyTargetPruneForcedId);
+  }
+  bool PolicyTargetHybridTail() const {
+    return options_.Get<bool>(kPolicyTargetHybridTailId);
+  }
+  float GetPolicyTargetBlendLambda() const {
+    return options_.Get<float>(kPolicyTargetBlendLambdaId);
+  }
+  float GetPolicyTargetBlendTau() const {
+    return options_.Get<float>(kPolicyTargetBlendTauId);
+  }
+  float GetPolicyTargetDrawSteerBeta() const {
+    return options_.Get<float>(kPolicyTargetDrawSteerBetaId);
+  }
+  float GetPolicyTargetDrawSteerTauD() const {
+    return options_.Get<float>(kPolicyTargetDrawSteerTauDId);
+  }
+  float GetPolicyTargetUnvisitedGap() const {
+    return options_.Get<float>(kPolicyTargetUnvisitedGapId);
+  }
+  float GetPolicyTargetTailEps() const {
+    return options_.Get<float>(kPolicyTargetTailEpsId);
+  }
+  float GetPolicyTargetTailKappa() const {
+    return options_.Get<float>(kPolicyTargetTailKappaId);
+  }
+  float GetPolicyTargetTailTau() const {
+    return options_.Get<float>(kPolicyTargetTailTauId);
+  }
+  float GetPolicyTargetTailFloor() const {
+    return options_.Get<float>(kPolicyTargetTailFloorId);
+  }
+  float GetPolicyTargetTailShrink() const {
+    return options_.Get<float>(kPolicyTargetTailShrinkId);
+  }
+  bool GetTrainingDataV7() const {
+    return options_.Get<bool>(kTrainingDataV7Id);
+  }
+  bool GetTrainingDataChildQ() const {
+    return options_.Get<bool>(kTrainingDataChildQId);
+  }
+  int GetTrainingDataChildQMinVisits() const {
+    return options_.Get<int>(kTrainingDataChildQMinVisitsId);
+  }
+  bool GetTrainingDataV8() const {
+    return options_.Get<bool>(kTrainingDataV8Id);
+  }
+  int GetTrainingDataRecipeId() const {
+    return options_.Get<int>(kTrainingDataRecipeIdId);
+  }
 
   // Search parameter IDs.
   static const OptionId kMaxPrefetchBatchId;
@@ -333,6 +393,26 @@ class SearchParams : public BaseSearchParams {
   static const OptionId kPolicyPostProcessingUtilityAlphaId;
   static const OptionId kPolicyPostProcessingWeightTemperatureId;
   static const OptionId kTemperatureSimulatedCpuctId;
+  static const OptionId kUsePolicyTargetGrill9Id;
+  static const OptionId kGrill9AtanhScaleId;
+  static const OptionId kGrill9VisitBlendId;
+  static const OptionId kPolicyTargetPruneForcedId;
+  static const OptionId kPolicyTargetHybridTailId;
+  static const OptionId kPolicyTargetBlendLambdaId;
+  static const OptionId kPolicyTargetBlendTauId;
+  static const OptionId kPolicyTargetDrawSteerBetaId;
+  static const OptionId kPolicyTargetDrawSteerTauDId;
+  static const OptionId kPolicyTargetUnvisitedGapId;
+  static const OptionId kPolicyTargetTailEpsId;
+  static const OptionId kPolicyTargetTailKappaId;
+  static const OptionId kPolicyTargetTailTauId;
+  static const OptionId kPolicyTargetTailFloorId;
+  static const OptionId kPolicyTargetTailShrinkId;
+  static const OptionId kTrainingDataV7Id;
+  static const OptionId kTrainingDataChildQId;
+  static const OptionId kTrainingDataChildQMinVisitsId;
+  static const OptionId kTrainingDataV8Id;
+  static const OptionId kTrainingDataRecipeIdId;
 
  private:
   const int kSolidTreeThreshold;

@@ -581,6 +581,197 @@ const OptionId SearchParams::kPolicyPostProcessingWeightTemperatureId{
          "sharpness is adjusted for different positions. Lower values mean "
          "variance focuses more towards good moves. Lower values add extra "
          "sharpness towards sharp positions."}};
+const OptionId SearchParams::kUsePolicyTargetGrill9Id{
+    {.long_flag = "policy-target-grill9",
+     .uci_option = "PolicyTargetGrill9",
+     .help_text =
+         "Replace the policy training target with the prior-anchored "
+         "exponential kernel: anchor=max(prior, visit_share), "
+         "L=atanh(scale*QM), tau solved per position so target entropy "
+         "matches raw-visit entropy, then blended with raw visit share. "
+         "Takes priority over UsePolicyPostProcessing."}};
+const OptionId SearchParams::kGrill9AtanhScaleId{
+    {.long_flag = "grill9-atanh-scale",
+     .uci_option = "Grill9AtanhScale",
+     .help_text = "Scale s applied to QM before atanh: L = atanh(s*QM). "
+                  "Caps the noise amplification near |QM|=1."}};
+const OptionId SearchParams::kGrill9VisitBlendId{
+    {.long_flag = "grill9-visit-blend",
+     .uci_option = "Grill9VisitBlend",
+     .help_text =
+         "Fraction of the raw visit distribution linearly blended into the "
+         "final target: pi = (1-beta)*kernel + beta*visits. Hard floor for "
+         "search-discovered (blindspot) moves."}};
+const OptionId SearchParams::kPolicyTargetPruneForcedId{
+    {.long_flag = "policy-target-prune-forced",
+     .uci_option = "PolicyTargetPruneForced",
+     .help_text =
+         "KataGo forced-then-prune: de-noise the recorded policy target by "
+         "removing forced-exploration and Dirichlet-driven excess from the "
+         "root visit counts (PUCT inversion with the clean network prior) "
+         "before building the target. Fixes N-reading targets (raw visits, "
+         "Grill9) polluted by ForcedExplorationVisits/DirichletNoise. No-op "
+         "when there are no forced-exploration visits, so it is bit-identical "
+         "to the un-pruned target with ForcedExplorationVisits 0."}};
+const OptionId SearchParams::kPolicyTargetHybridTailId{
+    {.long_flag = "policy-target-hybrid-tail",
+     .uci_option = "PolicyTargetHybridTail",
+     .help_text =
+         "With PolicyTargetPruneForced and Grill9 off (hybrid_pp): reshape the "
+         "floored (N'=1) low-visit tail by a value-softmax (the policy "
+         "post-processing harmonic kernel) over the tail moves' Q, conserving "
+         "the tail's mass. Orders rarely-searched moves by value instead of a "
+         "flat floor; the high-visit head is unchanged."}};
+const OptionId SearchParams::kPolicyTargetBlendLambdaId{
+    {.long_flag = "policy-target-blend-lambda",
+     .uci_option = "PolicyTargetBlendLambda",
+     .help_text =
+         "Geometric blend weight for the recorded policy target: "
+         "target ~ hybrid^lambda * (P*exp(-dLoss/tau))^(1-lambda). 0 (default) "
+         "disables the blend and records the plain hybrid/k2 target. "
+         "Bench-v2 sweep optimum ~0.7 (broad plateau 0.6-0.8)."}};
+const OptionId SearchParams::kPolicyTargetBlendTauId{
+    {.long_flag = "policy-target-blend-tau",
+     .uci_option = "PolicyTargetBlendTau",
+     .help_text =
+         "Absolute loss-probability temperature of the blend's value-sharp "
+         "factor. Anchored in value units (never entropy-matched to the "
+         "current net) for RL safety. Sweep optimum ~0.04."}};
+const OptionId SearchParams::kPolicyTargetDrawSteerBetaId{
+    {.long_flag = "policy-target-draw-steer-beta",
+     .uci_option = "PolicyTargetDrawSteerBeta",
+     .help_text =
+         "Directional draw-mass steering strength beta0 on the recorded "
+         "target: multiply by exp(beta*dD/tauD) with "
+         "beta = -beta0*tanh(rootQ/0.3): the better side is steered away "
+         "from draw-drift, the worse side toward versatile drawish "
+         "defenses. 0 (default) disables. Requires forced-exploration "
+         "coverage for reliable per-move D estimates; sweep optimum ~0.5."}};
+const OptionId SearchParams::kPolicyTargetDrawSteerTauDId{
+    {.long_flag = "policy-target-draw-steer-tau-d",
+     .uci_option = "PolicyTargetDrawSteerTauD",
+     .help_text = "Draw-mass steering temperature tau_D (sweep ~0.25)."}};
+const OptionId SearchParams::kPolicyTargetUnvisitedGapId{
+    {.long_flag = "policy-target-unvisited-gap",
+     .uci_option = "PolicyTargetUnvisitedGap",
+     .help_text =
+         "Loss-probability gap charged to a move the root search never "
+         "visited, in the blend's value-sharp factor and in the tail "
+         "insurance term. Was a hard-coded 0.5; exposed because it divides "
+         "by tau, so raising tau silently multiplies the whole unvisited "
+         "class (0.0235 of a visited best move at tau 0.04 vs 0.1174 at "
+         "0.07, after the lambda exponent). Inert under a forced-exploration "
+         "regime that visits every legal move."}};
+const OptionId SearchParams::kTrainingDataV7Id{
+    {.long_flag = "training-data-v7",
+     .uci_option = "TrainingDataV7",
+     .help_text =
+         "Write 8396-byte V7 training records instead of 8356-byte V6 ones. "
+         "V7 adds d_st, the two lookahead move indices and reserved[0..7]; "
+         "the rescorer normally produces those, so emitting them at datagen "
+         "time means a record can carry information the rescorer cannot "
+         "reconstruct. Off by default: with this off the writer is "
+         "byte-identical to the pre-cv3 one."}};
+const OptionId SearchParams::kTrainingDataChildQId{
+    {.long_flag = "training-data-child-q",
+     .uci_option = "TrainingDataChildQ",
+     .help_text =
+         "Record the search's per-move Q for the top root children into the "
+         "V7 record's reserved[4..7] window (requires --training-data-v7). "
+         "The policy target is visit-derived and therefore prior-"
+         "contaminated; per-move Q is the search's own evaluation of each "
+         "move and is the only per-edge VALUE signal the format can carry. "
+         "It cannot be recovered later: the rescorer links no search backend, "
+         "so this is datagen-time or never."}};
+const OptionId SearchParams::kTrainingDataChildQMinVisitsId{
+    {.long_flag = "training-data-child-q-min-visits",
+     .uci_option = "TrainingDataChildQMinVisits",
+     .help_text =
+         "Minimum visit count a root child needs before its Q is recorded by "
+         "--training-data-child-q. A child below the floor is not a candidate "
+         "at all, so the stored set is the top-K by visits AMONG children that "
+         "clear it (the empty-slot sentinel already supports a short count). "
+         "This floor is the only noise control the V7 vehicle can ever have: "
+         "the stored policy target is kernel-shaped, not visit fractions, and "
+         "total_N is not stored, so per-child visit counts are underivable "
+         "from a V7 record and confidence weighting cannot be added later. "
+         "Measured on the datagen regime, however, child Q accuracy is FLAT in "
+         "visit count (r=0.985-0.990 against a 100k-node reference for every "
+         "bucket from N=2 to N=200+, worst at N>=200), so a high floor "
+         "discards signal rather than noise: floor 10 costs 23% of stored "
+         "children and 15.5% of per-position Q-range coverage, floor 5 costs "
+         "~nothing. Treat this as insurance against a future reduced-forced-"
+         "exploration regime, not as a correction to the current one."}};
+const OptionId SearchParams::kTrainingDataV8Id{
+    {.long_flag = "training-data-v8",
+     .uci_option = "TrainingDataV8",
+     .help_text =
+         "Write 11036-byte V8 training records: the V7 record byte for byte "
+         "(including the packed 6-child window), plus a 128-slot per-legal-"
+         "move table carrying the net prior, the child's Q/D/M, the raw and "
+         "de-forced visit counts, and the best reply below each child. "
+         "Implies --training-data-v7. A corpus is not re-targetable without "
+         "it: per-move priors and de-forced counts were never stored, so "
+         "every pre-V8 corpus is frozen at the recipe that generated it. "
+         "Requires a non-canonical input format -- the reply index is written "
+         "in the child's own frame and a canonical format can give the child "
+         "a different board transform from the root."}};
+const OptionId SearchParams::kTrainingDataRecipeIdId{
+    {.long_flag = "training-data-recipe-id",
+     .uci_option = "TrainingDataRecipeId",
+     .help_text =
+         "Datagen target-recipe registry id stamped into every V8 record "
+         "(0 unknown, 1 cv, 2 cv2, 3 cv3, 4 cv4-A, 5 cv4-B). The record says "
+         "which recipe shaped its policy target, so a mixed pool can never be "
+         "trained on unknowingly. Set it in the launcher; the flags alone do "
+         "not identify a recipe."}};
+const OptionId SearchParams::kPolicyTargetTailEpsId{
+    {.long_flag = "policy-target-tail-eps",
+     .uci_option = "PolicyTargetTailEps",
+     .help_text =
+         "Share of the recorded target reserved for an ordered tail "
+         "insurance term: target = (1-eps)*blend + eps*renorm(P^kappa * "
+         "exp(-dLoss/tau_tail)). PUCT needs about (dQ/(cpuct*P))^2 nodes to "
+         "give a move its first visit, so mass lost from a good but quiet "
+         "move costs the NEXT generation quadratically; this bounds the "
+         "worst case without softening the top of the distribution. Ordered, "
+         "never uniform. 0 (default) records the target unchanged."}};
+const OptionId SearchParams::kPolicyTargetTailKappaId{
+    {.long_flag = "policy-target-tail-kappa",
+     .uci_option = "PolicyTargetTailKappa",
+     .help_text =
+         "Prior exponent of the tail insurance term. 0.5 (default) is "
+         "square-root compression of the network prior, roughly the "
+         "bandit-optimal exploration shape; 0 drops the prior entirely and "
+         "leaves a pure value-shaped tail."}};
+const OptionId SearchParams::kPolicyTargetTailTauId{
+    {.long_flag = "policy-target-tail-tau",
+     .uci_option = "PolicyTargetTailTau",
+     .help_text =
+         "Fixed temperature of the tail term's value factor, in "
+         "LOSS-PROBABILITY units (dLoss spans [0,1], so this is half the "
+         "scale of a Q-unit temperature). 0 (default) omits the value factor "
+         "and shapes the tail by prior alone. Ignored when "
+         "PolicyTargetTailFloor is set."}};
+const OptionId SearchParams::kPolicyTargetTailFloorId{
+    {.long_flag = "policy-target-tail-floor",
+     .uci_option = "PolicyTargetTailFloor",
+     .help_text =
+         "If greater than 0, solve the tail temperature per position so that "
+         "a move at the worst possible loss gap still receives this share of "
+         "the insurance mass (0.00125 = 1/800). Makes tail magnitude encode "
+         "graded badness consistently across positions. A single temperature "
+         "cannot serve both the top and this floor, which is why the "
+         "insurance is a separate mixture component rather than a softer "
+         "PolicyTargetBlendTau."}};
+const OptionId SearchParams::kPolicyTargetTailShrinkId{
+    {.long_flag = "policy-target-tail-shrink",
+     .uci_option = "PolicyTargetTailShrink",
+     .help_text =
+         "Shrink constant k pulling a child's Q toward the root value by "
+         "N/(N+k) before the tail term reads it as a loss. A one-visit Q is "
+         "sampling noise rather than evidence of badness. 0 (default) uses "
+         "raw Q."}};
 const OptionId SearchParams::kTemperatureSimulatedCpuctId{
     {.long_flag = "temperature-simulated-cpuct",
      .uci_option = "TemperatureSimulatedCPuct",
@@ -696,6 +887,27 @@ void SearchParams::Populate(OptionsParser* options) {
                             100.0f) = 0.42f;
   options->Add<FloatOption>(kPolicyPostProcessingWeightTemperatureId, 0.0001f,
                             1000.0f) = 0.07f;
+  options->Add<BoolOption>(kUsePolicyTargetGrill9Id) = false;
+  options->Add<FloatOption>(kGrill9AtanhScaleId, 0.5f, 0.999999f) = 0.99f;
+  options->Add<FloatOption>(kGrill9VisitBlendId, 0.0f, 1.0f) = 0.10f;
+  options->Add<BoolOption>(kPolicyTargetPruneForcedId) = false;
+  options->Add<BoolOption>(kPolicyTargetHybridTailId) = false;
+  options->Add<FloatOption>(kPolicyTargetBlendLambdaId, 0.0f, 1.0f) = 0.0f;
+  options->Add<FloatOption>(kPolicyTargetBlendTauId, 0.001f, 1.0f) = 0.04f;
+  options->Add<FloatOption>(kPolicyTargetDrawSteerBetaId, 0.0f, 5.0f) = 0.0f;
+  options->Add<FloatOption>(kPolicyTargetDrawSteerTauDId, 0.01f, 2.0f) =
+      0.25f;
+  options->Add<FloatOption>(kPolicyTargetUnvisitedGapId, 0.0f, 2.0f) = 0.5f;
+  options->Add<FloatOption>(kPolicyTargetTailEpsId, 0.0f, 0.5f) = 0.0f;
+  options->Add<FloatOption>(kPolicyTargetTailKappaId, 0.0f, 2.0f) = 0.5f;
+  options->Add<FloatOption>(kPolicyTargetTailTauId, 0.0f, 5.0f) = 0.0f;
+  options->Add<FloatOption>(kPolicyTargetTailFloorId, 0.0f, 0.1f) = 0.0f;
+  options->Add<FloatOption>(kPolicyTargetTailShrinkId, 0.0f, 64.0f) = 0.0f;
+  options->Add<BoolOption>(kTrainingDataV7Id) = false;
+  options->Add<BoolOption>(kTrainingDataChildQId) = false;
+  options->Add<IntOption>(kTrainingDataChildQMinVisitsId, 1, 1000) = 10;
+  options->Add<BoolOption>(kTrainingDataV8Id) = false;
+  options->Add<IntOption>(kTrainingDataRecipeIdId, 0, 65535) = 0;
   options->Add<FloatOption>(kTemperatureSimulatedCpuctId, 0.0f, 100.0f) = 2.53f;
 }
 

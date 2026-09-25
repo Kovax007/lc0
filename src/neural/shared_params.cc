@@ -65,6 +65,21 @@ const OptionId SharedBackendParams::kNNCacheSizeId{
     "Number of positions to store in a memory cache. A large cache can speed "
     "up searching, but takes memory."};
 
+const OptionId SharedBackendParams::kBatchMergeMaxBatch{
+    "batch-merge-max-batch", "BatchMergeMaxBatch",
+    "Merge the batches of concurrent callers into a single backend batch of at "
+    "most this size. 0 disables merging. Raises the batch the GPU sees, which "
+    "matters most for selfplay, where each game thread evaluates only a few "
+    "positions at a time."};
+const OptionId SharedBackendParams::kBatchMergeWaitUs{
+    "batch-merge-wait-us", "BatchMergeWaitUs",
+    "How long, in microseconds, a batch merging worker waits for more work "
+    "before running a batch it could already run. Trades per-game latency for "
+    "batch size; 0 runs immediately."};
+const OptionId SharedBackendParams::kBatchMergeThreads{
+    "batch-merge-threads", "BatchMergeThreads",
+    "Number of batch merging worker threads."};
+
 void SharedBackendParams::Populate(OptionsParser* options) {
   options->Add<FloatOption>(kPolicySoftmaxTemp, 0.1f, 10.0f) = 1.359f;
   std::vector<std::string> history_fill_opt{"no", "fen_only", "always"};
@@ -81,6 +96,10 @@ void SharedBackendParams::Populate(OptionsParser* options) {
   options->Add<StringOption>(SharedBackendParams::kBackendOptionsId);
   options->Add<IntOption>(SharedBackendParams::kNNCacheSizeId, 0, 999999999) =
       2000000;
+  options->Add<IntOption>(SharedBackendParams::kBatchMergeMaxBatch, 0, 4096) = 0;
+  options->Add<IntOption>(SharedBackendParams::kBatchMergeWaitUs, 0, 1000000) =
+      200;
+  options->Add<IntOption>(SharedBackendParams::kBatchMergeThreads, 1, 64) = 1;
 }
 
 }  // namespace lczero

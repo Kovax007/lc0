@@ -221,8 +221,16 @@ bool TrainingDataReader::ReadChunk(V6TrainingData* data) {
         if (read_size < 0) throw Exception("Corrupt read.");
         return read_size == v4_extra + v5_extra + v6_extra;
       }
+      case 7:
+        // V7 records are 8396 bytes and do not fit a V6 buffer. This reader
+        // is V6-only by design; fail with a message that names the actual
+        // problem instead of the generic "unknown format".
+        throw Exception(
+            "V7 training record read into a V6 buffer. This reader does not "
+            "support V7; use a V7-aware consumer.");
       default:
-        throw Exception("Unknown format.");
+        throw Exception("Unknown format. Version=" +
+                        std::to_string(orig_version));
     }
   }
 }

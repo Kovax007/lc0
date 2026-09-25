@@ -29,6 +29,7 @@
 
 #include <numeric>
 
+#include "neural/batchmerge.h"
 #include "neural/memcache.h"
 #include "neural/shared_params.h"
 #include "search/classic/search.h"
@@ -74,7 +75,9 @@ void Benchmark::Run(bool run_shorter_benchmark) {
     auto option_dict = options.GetOptionsDict();
 
     auto backend = CreateMemCache(
-        BackendManager::Get()->CreateFromParams(option_dict), option_dict);
+        MaybeWrapWithBatchMerging(
+            BackendManager::Get()->CreateFromParams(option_dict), option_dict),
+        option_dict);
 
     const int visits = option_dict.Get<int>(kNodesId);
     const int movetime = option_dict.Get<int>(kMovetimeId);

@@ -30,9 +30,12 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <iterator>
+#include <mutex>
 #include <sstream>
 #include <thread>
 
@@ -521,7 +524,8 @@ inline int64_t EstimateForcedVisits(const SearchParams& params,
   const float U_coeff =
       ComputeCpuct(params, node->GetN(), /* is_root_node= */ true) *
       std::sqrt(std::max(node->GetChildrenVisits(), 1u));
-  float best_S = -1.0f - params.GetMovesLeftMaxEffect();
+  float best_QM = -1.0f - params.GetMovesLeftMaxEffect();
+  EdgeAndNode best_edge;
   for (const auto& edge : node->Edges()) {
     if (edge.GetN() == 0) {
       break;
@@ -529,10 +533,21 @@ inline int64_t EstimateForcedVisits(const SearchParams& params,
 
     float Q = edge.GetQ(0.0f, draw_score);
     float M = m_evaluator.GetMUtility(edge, Q);
-    float U = std::max(edge.GetU(U_coeff), 1e-4f);
-    float S = Q + M + U;
-    best_S = std::max(best_S, S);
+    if (Q + M > best_QM) {
+      best_QM = Q + M;
+      best_edge = edge;
+    }
   }
+
+  if (best_edge.IsTerminal()) {
+    // TODO: Implement an approximation how much extra visits the terminal
+    // should have been given.
+    return 0;
+  }
+
+  assert(best_edge.GetP() > 0.0f);
+
+  float best_S = best_QM + best_edge.GetU(U_coeff);
 
   float sum = 0.0f;
   Edge* iter = root_policy.get();
@@ -773,6 +788,582 @@ std::int64_t Search::GetTotalPlayouts() const {
   return total_playouts_;
 }
 
+namespace {
+
+// Policy training target from root search stats via a prior-anchored
+// exponential kernel over utility gaps in atanh space:
+//   anchor_i = max(prior_i, visit_share_i)
+//   L_i      = atanh(clamp(s * QM_i))
+//   pi(tau)  ~ anchor_i * exp(-(L_max - L_i) / tau),
+// with tau solved per position so that entropy(pi) equals the entropy of the
+// raw visit distribution, then blended: pi = (1-beta)*pi(tau) + beta*visits.
+// The anchor floor guarantees a search-confirmed move is never weighted below
+// its own visit evidence (blindspot preservation); the visit blend adds a
+// hard floor of beta times the visit share on top. Unvisited moves keep their
+// prior share, mirroring the legacy path's behavior.
+// Returns an empty vector on degenerate input; the caller then falls back to
+// the legacy target.
+std::vector<std::tuple<float, float>> ComputeGrill9Target(
+    const std::vector<std::tuple<Move, uint32_t, double>>& visits,
+    const std::vector<Move>& legal_moves, const std::vector<float>& nn_p,
+    float policy_temp, double atanh_scale, double visit_blend) {
+  const size_t n = legal_moves.size();
+  if (n == 0 || nn_p.size() < n) return {};
+
+  std::vector<double> p(n), v(n), L(n), qm(n);
+  std::vector<double> nn_policy_out(n);
+  std::vector<uint32_t> nvis(n);
+  std::vector<bool> visited(n);
+
+  double p_sum = 0.0, n_sum = 0.0, nn_out_sum = 0.0;
+  for (size_t i = 0; i < n; ++i) {
+    const auto pos = std::find_if(
+        visits.begin(), visits.end(),
+        [&](const auto& m) { return std::get<0>(m) == legal_moves[i]; });
+    if (pos == visits.end()) {
+      throw Exception("Legal moves don't match the root node.");
+    }
+    nvis[i] = std::get<1>(*pos);
+    qm[i] = std::get<2>(*pos);
+    visited[i] = nvis[i] > 0;
+    p[i] = std::max<double>(nn_p[i], 0.0);
+    p_sum += p[i];
+    n_sum += nvis[i];
+    // Second tuple element keeps the legacy semantics (temperature-undone
+    // prior) so the writer's policy_kld statistic stays comparable.
+    nn_policy_out[i] = std::pow(std::max<double>(nn_p[i], 0.0), policy_temp);
+    nn_out_sum += nn_policy_out[i];
+  }
+  if (p_sum <= 0.0 || n_sum <= 0.0 || nn_out_sum <= 0.0) return {};
+
+  for (size_t i = 0; i < n; ++i) {
+    p[i] /= p_sum;
+    v[i] = nvis[i] / n_sum;
+    nn_policy_out[i] /= nn_out_sum;
+  }
+
+  double unvisited_prior = 0.0;
+  size_t n_visited = 0;
+  for (size_t i = 0; i < n; ++i) {
+    if (visited[i]) {
+      ++n_visited;
+    } else {
+      unvisited_prior += p[i];
+    }
+  }
+  const double visited_mass = 1.0 - unvisited_prior;
+  if (n_visited == 0 || visited_mass <= 1e-9) return {};
+
+  // Within the visited subset: renormalized prior, visit share (already sums
+  // to 1 over visited moves), anchor floor, and the atanh-space utility.
+  double L_max = -std::numeric_limits<double>::infinity();
+  std::vector<double> anchor(n, 0.0);
+  for (size_t i = 0; i < n; ++i) {
+    if (!visited[i]) continue;
+    anchor[i] = std::max(p[i] / visited_mass, v[i]);
+    const double x =
+        std::clamp(qm[i] * atanh_scale, -0.999999, 0.999999);
+    L[i] = std::atanh(x);
+    L_max = std::max(L_max, L[i]);
+  }
+
+  double target_entropy = 0.0;
+  for (size_t i = 0; i < n; ++i) {
+    if (visited[i] && v[i] > 0.0) target_entropy -= v[i] * std::log(v[i]);
+  }
+
+  std::vector<double> kernel(n, 0.0);
+  const auto eval_kernel = [&](double tau) {
+    double sum = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+      if (!visited[i]) continue;
+      kernel[i] = anchor[i] * std::exp(-(L_max - L[i]) / tau);
+      sum += kernel[i];
+    }
+    double h = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+      if (!visited[i]) continue;
+      kernel[i] = sum > 0.0 ? kernel[i] / sum : 1.0 / n_visited;
+      if (kernel[i] > 0.0) h -= kernel[i] * std::log(kernel[i]);
+    }
+    return h;
+  };
+
+  // Entropy is monotone (non-decreasing) in tau for this kernel family;
+  // plain bisection over the same bracket the reference implementation uses.
+  double lo = 1e-3, hi = 50.0, tau;
+  if (eval_kernel(lo) >= target_entropy) {
+    tau = lo;
+  } else if (eval_kernel(hi) <= target_entropy) {
+    tau = hi;
+  } else {
+    for (int it = 0; it < 100 && hi - lo > 1e-8; ++it) {
+      const double mid = 0.5 * (lo + hi);
+      if (eval_kernel(mid) < target_entropy) {
+        lo = mid;
+      } else {
+        hi = mid;
+      }
+    }
+    tau = 0.5 * (lo + hi);
+  }
+  eval_kernel(tau);
+
+  std::vector<std::tuple<float, float>> out;
+  out.reserve(n);
+  for (size_t i = 0; i < n; ++i) {
+    const double target =
+        visited[i] ? ((1.0 - visit_blend) * kernel[i] + visit_blend * v[i]) *
+                         visited_mass
+                   : p[i];
+    out.emplace_back(static_cast<float>(target),
+                     static_cast<float>(nn_policy_out[i]));
+  }
+
+  // Test hook: echo inputs and outputs so an external checker can recompute
+  // the target from the exact same numbers (LC0_TARGET_DEBUG=<path>).
+  static const char* debug_path = std::getenv("LC0_TARGET_DEBUG");
+  if (debug_path) {
+    static std::mutex debug_mutex;
+    std::lock_guard<std::mutex> lock(debug_mutex);
+    std::ofstream f(debug_path, std::ios::app);
+    f << std::setprecision(17) << "{\"tau\":" << tau
+      << ",\"visited_mass\":" << visited_mass << ",\"moves\":[";
+    for (size_t i = 0; i < n; ++i) {
+      f << (i ? "," : "") << "{\"uci\":\"" << legal_moves[i].ToString(true)
+        << "\",\"N\":" << nvis[i] << ",\"p_raw\":" << nn_p[i]
+        << ",\"QM\":" << (visited[i] ? qm[i] : -999.0)
+        << ",\"target\":" << std::get<0>(out[i]) << "}";
+    }
+    f << "]}\n";
+  }
+
+  return out;
+}
+
+}  // namespace
+
+std::vector<double> Search::DeforcedVisits(
+    const std::vector<float>* clean_prior,
+    std::vector<bool>* floored) const {
+  SharedMutex::SharedLock lock(nodes_mutex_);
+  const float draw_score = GetDrawScore(/* is_odd_depth= */ false);
+  const float fpu =
+      GetFpu(params_, root_node_, /* is_root= */ true, draw_score);
+  MEvaluator m_evaluator = backend_attributes_.has_mlh
+                               ? MEvaluator(params_, root_node_)
+                               : MEvaluator();
+  const float U_coeff =
+      ComputeCpuct(params_, root_node_->GetN(), /* is_root_node= */ true,
+                   true) *
+      std::sqrt(std::max(root_node_->GetChildrenVisits(), 1u));
+
+  // Snapshot the root edges in iteration order (identical to the order
+  // GetVisitDistribution builds `visits`, so results index-align with it).
+  struct EdgeSnapshot {
+    double N, Q, M, p_clean, p_edge;
+    bool filtered, zero_policy;
+  };
+  std::vector<EdgeSnapshot> es;
+  es.reserve(root_node_->GetNumEdges());
+  size_t idx = 0;
+  double clean_sum = 0.0;
+  for (const auto& edge : root_node_->Edges()) {
+    EdgeSnapshot e;
+    e.N = edge.GetN();
+    e.Q = edge.GetQ(fpu, draw_score);
+    e.M = m_evaluator.GetMUtility(edge, e.Q);
+    e.p_edge = edge.GetP();
+    e.p_clean = (clean_prior && idx < clean_prior->size())
+                    ? std::max(0.0f, (*clean_prior)[idx])
+                    : e.p_edge;
+    clean_sum += e.p_clean;
+    e.zero_policy = edge.IsZeroPolicy();
+    e.filtered = !root_move_filter_.empty() &&
+                 std::find(root_move_filter_.begin(), root_move_filter_.end(),
+                           edge.GetMove()) == root_move_filter_.end();
+    es.push_back(e);
+    ++idx;
+  }
+  const size_t n = es.size();
+  std::vector<double> pruned(n);
+  for (size_t i = 0; i < n; ++i) pruned[i] = es[i].N;
+  if (floored) floored->assign(n, false);
+  if (n == 0) return pruned;
+
+  // Prior used for the inversion: renormalized clean prior (removes Dirichlet
+  // excess) when supplied, otherwise the edge's own (noised) prior.
+  const bool use_clean = clean_prior && clean_sum > 0.0;
+  const auto P = [&](size_t i) {
+    return use_clean ? es[i].p_clean / clean_sum : es[i].p_edge;
+  };
+
+  // Anchor = most-visited eligible edge (never pruned).
+  size_t best = n;
+  double max_n = -1.0;
+  for (size_t i = 0; i < n; ++i) {
+    if (es[i].filtered) continue;
+    if (es[i].N > max_n) {
+      max_n = es[i].N;
+      best = i;
+    }
+  }
+  if (best == n || es[best].zero_policy) return pruned;  // nothing to de-force
+
+  const double best_QM = es[best].Q + es[best].M;
+  double best_S = best_QM + P(best) * U_coeff / (1.0 + es[best].N);
+
+  // Correct best_S if the best evaluation isn't the most visits (port of
+  // search.cc GetBestRootChildWithTemperature best_S correction).
+  for (size_t i = 0; i < n; ++i) {
+    if (i == best || es[i].filtered || es[i].zero_policy) continue;
+    const double Q = es[i].Q, M = es[i].M;
+    if (Q + M <= best_QM) continue;
+    const double C = Q + M - best_QM;
+    const double N = es[i].N + es[best].N;
+    if (N <= 0.0 || C <= 0.0) continue;
+    const double U1 = P(i) * U_coeff;
+    const double U2 = P(best) * U_coeff;
+    double xs = -C * N * N + N * U1 + N * U2;
+    xs *= xs;
+    const double xrr =
+        xs - 4 * C * N * N * (U2 - C * N - C - N * U1 - U1);
+    if (xrr < 0) continue;
+    const double xr = std::sqrt(xrr);
+    const double d = 2 * C * N * N;
+    const double xp = (xr + C * N * N - N * U1 - N * U2) / d;
+    const double xm = (-xr + C * N * N - N * U1 - N * U2) / d;
+    double x = (xp >= 0.0 && xp <= 1.0) ? xp : xm;
+    x = std::min(std::max(x, 1e-9), 1.0 - 1e-9);
+    const double S = (Q + M) + P(i) * U_coeff / (1.0 + N * x);
+    if (S > best_S) best_S = S;
+  }
+
+  // Per-edge inversion: N' = the visit count at which this edge's PUCT score
+  // equals best_S; excess above that is forcing/noise. Clamp to [1, N] so
+  // pruning can only remove visits, never invent them.
+  for (size_t i = 0; i < n; ++i) {
+    if (i == best || es[i].filtered || es[i].zero_policy) continue;
+    if (es[i].N <= 0.0) continue;
+    const double denom = best_S - es[i].Q - es[i].M;
+    if (denom <= 1e-9) continue;  // QM at/above best_S: infinite natural, keep N
+    const double nat = P(i) * U_coeff / denom - 1.0;
+    const double val = std::max(1.0, std::ceil(nat));
+    pruned[i] = std::min(es[i].N, val);
+    if (floored && val <= 1.0 && es[i].N > 1.0) (*floored)[i] = true;
+  }
+
+  // Test hook: echo the inversion inputs/outputs so an external checker can
+  // recompute the de-forced visits from the exact same numbers and confirm the
+  // C++ port matches the Python reference (LC0_DEFORCE_DEBUG=<path>).
+  static const char* deforce_debug = std::getenv("LC0_DEFORCE_DEBUG");
+  if (deforce_debug) {
+    static std::mutex deforce_mutex;
+    std::lock_guard<std::mutex> guard(deforce_mutex);
+    std::ofstream f(deforce_debug, std::ios::app);
+    f << std::setprecision(17) << "{\"U_coeff\":" << U_coeff << ",\"best\":"
+      << best << ",\"best_S\":" << best_S << ",\"use_clean\":"
+      << (use_clean ? 1 : 0) << ",\"moves\":[";
+    size_t j = 0;
+    for (const auto& edge : root_node_->Edges()) {
+      f << (j ? "," : "") << "{\"uci\":\"" << edge.GetMove().ToString(true)
+        << "\",\"N\":" << es[j].N << ",\"QM\":" << (es[j].Q + es[j].M)
+        << ",\"p_edge\":" << es[j].p_edge << ",\"p_clean\":" << es[j].p_clean
+        << ",\"pruned\":" << pruned[j] << ",\"floored\":"
+        << (floored && (*floored)[j] ? 1 : 0) << ",\"filtered\":"
+        << (es[j].filtered ? 1 : 0) << "}";
+      ++j;
+    }
+    f << "]}\n";
+  }
+  return pruned;
+}
+
+// Per-root-child search data for the V8 training record. See
+// trainingdata/childdata.h for why this is a separate pass rather than an
+// out-param of GetVisitDistribution.
+//
+// Everything here is what the SEARCH SAW, not what the recipe made of it, so
+// it is identical across every target kernel and the target computation stays
+// untouched.
+RootSearchData Search::GetRootChildData(
+    const std::vector<Move>& legal_moves) const {
+  RootSearchData out;
+  out.children.assign(legal_moves.size(), RootChildData());
+  out.fe_active = !forced_exploration_visits_.empty();
+  out.fe_visits = out.fe_active
+                      ? static_cast<uint32_t>(params_.GetForcedExplorationVisits())
+                      : 0u;
+
+  const std::optional<EvalResult> nneval = backend_->GetCachedEvaluation(
+      EvalPosition{played_history_.GetPositions(), legal_moves});
+  out.prior_present = nneval.has_value();
+
+  out.policy_softmax_temp = params_.GetPolicySoftmaxTemp();
+  out.ml_max_effect = params_.GetMovesLeftMaxEffect();
+  out.ml_threshold = params_.GetMovesLeftThreshold();
+  out.ml_slope = params_.GetMovesLeftSlope();
+  out.ml_constant_factor = params_.GetMovesLeftConstantFactor();
+  out.ml_scaled_factor = params_.GetMovesLeftScaledFactor();
+  out.ml_quadratic_factor = params_.GetMovesLeftQuadraticFactor();
+
+  // The de-forced counts, recomputed from the same inputs the target path
+  // uses. DeforcedVisits takes the nodes lock itself, so this happens before
+  // the walk below and not inside it.
+  std::vector<double> pruned;
+  if (params_.PolicyTargetPruneForced() && nneval && out.fe_active) {
+    std::vector<float> clean_prior;
+    {
+      SharedMutex::SharedLock lock(nodes_mutex_);
+      clean_prior.reserve(root_node_->GetNumEdges());
+      for (const auto& edge : root_node_->Edges()) {
+        const auto it = std::find(legal_moves.begin(), legal_moves.end(),
+                                  edge.GetMove(false));
+        clean_prior.push_back(it != legal_moves.end()
+                                  ? nneval->p[it - legal_moves.begin()]
+                                  : 0.0f);
+      }
+    }
+    pruned = DeforcedVisits(&clean_prior, nullptr);
+    out.deforced_present = true;
+  }
+
+  {
+    SharedMutex::SharedLock lock(nodes_mutex_);
+    out.m_present = backend_attributes_.has_mlh;
+    // The cpuct the inversion actually used, so N' is recomputable offline.
+    out.cpuct_at_root =
+        ComputeCpuct(params_, root_node_->GetN(), /* is_root_node= */ true,
+                     /* is_temperature= */ true);
+
+    size_t edge_i = 0;
+    for (const auto& edge : root_node_->Edges()) {
+      const Move move = edge.GetMove(false);
+      const auto it = std::find(legal_moves.begin(), legal_moves.end(), move);
+      if (it == legal_moves.end()) {
+        // A root edge that is not in the caller's legal-move list means the
+        // two enumerations disagree -- the same failure class the packed
+        // child-Q window guards against. Leave the slot unfilled rather than
+        // write a mis-framed move; the writer's index self-check will refuse
+        // the record.
+        ++edge_i;
+        continue;
+      }
+      RootChildData& c = out.children[it - legal_moves.begin()];
+      c.n_raw = edge.GetN();
+      // Q/D/M carry the child's own evaluation in the ROOT side-to-move frame.
+      // draw_score 0 deliberately: it is what the packed 6-child window uses,
+      // and slots 0..5 of the V8 table must cross-check against it exactly.
+      if (c.n_raw > 0) {
+        c.q = edge.GetQ(0.0f, 0.0f);
+        c.d = edge.GetD(0.0f);
+        c.m = edge.GetM(0.0f);
+      }
+      if (out.deforced_present && edge_i < pruned.size()) {
+        const double v = pruned[edge_i];
+        c.n_deforced = v > 0.0 ? static_cast<uint32_t>(std::llround(v)) : 0u;
+      }
+
+      // The second ply: the most-visited grandchild below this child, ties
+      // broken by the grandchild's own Q. Forced exploration evaluates every
+      // root move but does not expand it, so a reply exists only where the
+      // search descended at least twice -- which is exactly the contested set.
+      if (edge.HasNode() && edge.node()->GetN() > 1) {
+        uint32_t best_n = 0;
+        float best_q = -2.0f;
+        bool found = false;
+        Move best_move;
+        for (const auto& g : edge.node()->Edges()) {
+          const uint32_t gn = g.GetN();
+          if (gn == 0) continue;
+          const float gq = g.GetQ(0.0f, 0.0f);
+          if (gn > best_n || (gn == best_n && gq > best_q)) {
+            best_n = gn;
+            best_q = gq;
+            best_move = g.GetMove(false);
+            found = true;
+          }
+        }
+        if (found) {
+          // ⚠ FRAME: the grandchild move is stored in the CHILD's
+          // side-to-move frame, which is the frame opp_played_idx uses.
+          // transform 0 is correct only for non-canonical input formats; the
+          // writer asserts that before it emits a V8 record.
+          c.reply_idx = MoveToNNIndex(best_move, 0);
+          // The grandchild node's Q is in the child's frame; negate once to
+          // land in the root frame, so every Q column of the record shares
+          // one sign convention.
+          c.reply_q = -best_q;
+          c.reply_n = best_n;
+        }
+      }
+      ++edge_i;
+    }
+  }
+
+  // The prior, with the policy softmax temperature UNDONE.
+  //
+  // ⚠ `nneval->p` is NOT the net's raw policy. The BACKEND applies the
+  // temperature (`neural/wrapper.cc:148`: p_i = softmax(logit_i / T)), so what
+  // the search sees is already sharpened -- which is why the target paths in
+  // GetVisitDistribution all do `pow(p, T)` under the comment "undo the
+  // temperature". Raising to T recovers the T=1 softmax exactly, because
+  // (exp(l/T))^T = exp(l).
+  //
+  // The record stores the UNDONE prior, per DESIGN_cv4_v8_0902 §5.2. That is
+  // the net's own output, temperature-free, so the field means the same thing
+  // across recipes with different PSTs -- and a consumer that wants the search
+  // prior back can raise it to 1/T, T being a recipe constant. Storing the
+  // sharpened one instead would bake a recipe parameter into the field and
+  // make it uncomparable across arms.
+  //
+  // Normalised over ALL legal moves, matching GetVisitDistribution's
+  // `nn_policy /= policy_sum`.
+  if (nneval) {
+    const double pst = params_.GetPolicySoftmaxTemp();
+    double sum = 0.0;
+    for (size_t j = 0; j < legal_moves.size() && j < nneval->p.size(); ++j) {
+      const double p = nneval->p[j];
+      const double v = p > 0.0 ? std::pow(p, pst) : 0.0;
+      out.children[j].prior = static_cast<float>(v);
+      sum += v;
+    }
+    if (sum > 0.0) {
+      for (auto& c : out.children) {
+        if (c.prior >= 0.0f) c.prior = static_cast<float>(c.prior / sum);
+      }
+    }
+  }
+  return out;
+}
+
+// Ordered tail insurance, hoisted out of the k2 branch.
+//
+// Two corrections from DESIGN_cv4_v8_0902.md live here. C10: the blend AND the
+// insurance used to sit inside `if (PruneForced && nneval && !FE.empty())`, so
+// at FE=0 the whole cv2/cv3 target silently degraded to grill9-or-pp -- the
+// insurance is exactly what should cover the unvisited class once forced
+// exploration stops filling it, so it must run on every path. C11: the grill9
+// path returned BEFORE this block, which made "grill9 + insurance" unreachable
+// by flags; cv4-B needs it, and hoisting is the whole fix.
+//
+// `dist` is the assembled target in `legal_moves` order, whatever kernel built
+// it. Returns the tau actually used (0 when the term is off), for the test hook.
+float Search::ApplyOrderedTailInsurance(
+    std::vector<std::tuple<float, float>>* dist,
+    const std::vector<Move>& legal_moves,
+    const std::vector<size_t>& edge_idx_of_legal,
+    const std::vector<std::tuple<Move, uint32_t, double>>& visits,
+    const std::vector<float>& edge_q,
+    const std::vector<float>& edge_d) const {
+  auto& pruned_dist = *dist;
+    // Ordered tail insurance:
+    //   target' = (1-eps)*target + eps*renorm(P^kappa * exp(-dLoss/tau_tail))
+    // PUCT gives an unvisited move its first visit only after roughly
+    // (dQ/(cpuct*P))^2 nodes, so mass taken away from a good but quiet move
+    // costs the next generation's search quadratically. This term puts a
+    // bound on that worst case without softening the top of the target, and
+    // it keeps a move's prior from collapsing to zero across RL generations.
+    // The insurance is ORDERED -- shaped by the prior, the measured loss, or
+    // both -- never uniform, because a uniform tail is what makes a policy
+    // head a bad classifier.
+    const float tail_eps = params_.GetPolicyTargetTailEps();
+    float tail_tau_used = 0.0f;
+    if (tail_eps > 0.0f) {
+      const size_t n_legal = legal_moves.size();
+      const float kappa = params_.GetPolicyTargetTailKappa();
+      const float tail_floor = params_.GetPolicyTargetTailFloor();
+      const float shrink_k = params_.GetPolicyTargetTailShrink();
+      const float unvisited_gap = params_.GetPolicyTargetUnvisitedGap();
+
+      // Root value, visit-weighted, for the optional Q shrinkage.
+      double sum_n = 0.0, root_q = 0.0;
+      for (size_t k = 0; k < n_legal; ++k) {
+        const size_t idx = edge_idx_of_legal[k];
+        const uint32_t n_raw = std::get<1>(visits[idx]);
+        if (n_raw == 0) continue;
+        sum_n += n_raw;
+        root_q += static_cast<double>(edge_q[idx]) * n_raw;
+      }
+      if (sum_n > 0.0) root_q /= sum_n;
+
+      // Loss-probability gap per move, relative to the best visited move.
+      // dLoss lives in [0,1] here -- it comes from edge_q (raw Q), not from
+      // the Q+M quantity the de-force inversion uses.
+      std::vector<float> gap(n_legal, unvisited_gap);
+      float gmin = std::numeric_limits<float>::max();
+      for (size_t k = 0; k < n_legal; ++k) {
+        const size_t idx = edge_idx_of_legal[k];
+        const uint32_t n_raw = std::get<1>(visits[idx]);
+        if (n_raw == 0) continue;
+        float q = edge_q[idx];
+        if (shrink_k > 0.0f) {
+          // A one-visit Q is sampling noise, not evidence of badness; pull it
+          // back toward the root before reading it as a loss.
+          const float rq = static_cast<float>(root_q);
+          q = rq + (q - rq) * (n_raw / (n_raw + shrink_k));
+        }
+        gap[k] = 0.5f * (1.0f - edge_d[idx] - q);
+        gmin = std::min(gmin, gap[k]);
+      }
+      if (gmin != std::numeric_limits<float>::max()) {
+        for (size_t k = 0; k < n_legal; ++k) {
+          if (std::get<1>(visits[edge_idx_of_legal[k]]) != 0) gap[k] -= gmin;
+        }
+      }
+
+      std::vector<float> w(n_legal, 1.0f);
+      double w_mean = 0.0;
+      for (size_t k = 0; k < n_legal; ++k) {
+        if (kappa > 0.0f) {
+          w[k] = std::pow(std::max(std::get<1>(pruned_dist[k]), 1e-12f),
+                          kappa);
+        }
+        w_mean += w[k];
+      }
+      w_mean /= static_cast<double>(n_legal);
+
+      // Tail temperature: fixed, or solved per position so that a move at the
+      // worst possible loss gap still receives `tail_floor` of the insurance
+      // mass. The share is monotone in tau, so plain bisection converges.
+      tail_tau_used = params_.GetPolicyTargetTailTau();
+      if (tail_floor > 0.0f) {
+        double lo = 0.01, hi = 5.0;
+        for (int it = 0; it < 40; ++it) {
+          const double mid = 0.5 * (lo + hi);
+          double z = 0.0;
+          for (size_t k = 0; k < n_legal; ++k) {
+            z += w[k] * std::exp(-gap[k] / mid);
+          }
+          const double x = w_mean * std::exp(-1.0 / mid);
+          if (x / (z + x) < tail_floor) {
+            lo = mid;
+          } else {
+            hi = mid;
+          }
+        }
+        tail_tau_used = static_cast<float>(0.5 * (lo + hi));
+      }
+
+      double tail_sum = 0.0;
+      std::vector<double> tail(n_legal, 0.0);
+      for (size_t k = 0; k < n_legal; ++k) {
+        tail[k] = tail_tau_used > 0.0f
+                      ? w[k] * std::exp(-gap[k] / tail_tau_used)
+                      : w[k];
+        tail_sum += tail[k];
+      }
+      if (tail_sum > 0.0) {
+        for (size_t k = 0; k < n_legal; ++k) {
+          std::get<0>(pruned_dist[k]) =
+              (1.0f - tail_eps) * std::get<0>(pruned_dist[k]) +
+              tail_eps * static_cast<float>(tail[k] / tail_sum);
+        }
+      }
+    }
+  return tail_tau_used;
+}
+
 std::vector<std::tuple<float, float>> Search::GetVisitDistribution(
     const std::vector<Move>& legal_moves) const {
   std::vector<std::tuple<float, float>> distribution;
@@ -781,6 +1372,11 @@ std::vector<std::tuple<float, float>> Search::GetVisitDistribution(
   distribution.reserve(legal_moves.size());
   const float draw_score = GetDrawScore(false);
   double QM_max = -std::numeric_limits<double>::infinity();
+  // Per-edge Q/D snapshots (index-aligned with `visits`) for the blend /
+  // draw-steer factors of the recorded target.
+  std::vector<float> edge_q, edge_d;
+  edge_q.reserve(legal_moves.size());
+  edge_d.reserve(legal_moves.size());
   {
     SharedMutex::SharedLock lock(nodes_mutex_);
     float fpu = 0;
@@ -795,6 +1391,8 @@ std::vector<std::tuple<float, float>> Search::GetVisitDistribution(
           edge.GetN() > 0 ? Q + M : std::numeric_limits<double>::lowest();
       // TODO: Do we need to adjust QM if it is terminal?
       visits.emplace_back(edge.GetMove(false), N, QM);
+      edge_q.push_back(N > 0 ? static_cast<float>(Q) : 0.0f);
+      edge_d.push_back(N > 0 ? edge.GetD(0.0f) : 0.0f);
       QM_max = std::max(QM_max, Q + M);
     }
   }
@@ -805,6 +1403,258 @@ std::vector<std::tuple<float, float>> Search::GetVisitDistribution(
       EvalPosition{played_history_.GetPositions(), legal_moves});
   auto policy_iter =
       nneval ? nneval->p.begin() : std::vector<float>::iterator();
+
+  // KataGo forced-then-prune: de-noise the root visit counts before they reach
+  // any policy target. Off by default; a no-op (bit-identical to the un-pruned
+  // target) when there are no forced-exploration visits to remove.
+  if (params_.PolicyTargetPruneForced() && nneval &&
+      !forced_exploration_visits_.empty()) {
+    // Clean (un-noised) network prior in edge/`visits` order.
+    std::vector<float> clean_prior(visits.size());
+    for (size_t vi = 0; vi < visits.size(); ++vi) {
+      const auto it = std::find(legal_moves.begin(), legal_moves.end(),
+                                std::get<0>(visits[vi]));
+      clean_prior[vi] =
+          it != legal_moves.end() ? nneval->p[it - legal_moves.begin()] : 0.0f;
+    }
+    std::vector<bool> floored;
+    std::vector<double> pruned = DeforcedVisits(&clean_prior, &floored);
+
+    if (params_.UsePolicyTargetGrill9()) {
+      // k3: feed Grill9 the de-forced integer visit counts, then fall through
+      // to the Grill9 branch below (which reads `visits`).
+      for (size_t i = 0; i < visits.size(); ++i) {
+        std::get<1>(visits[i]) =
+            static_cast<uint32_t>(std::llround(std::max(0.0, pruned[i])));
+      }
+    } else {
+      // k2 / hybrid_pp: build the target from the de-forced visit share
+      // directly (Grill9 and policy-post-processing both off).
+      if (params_.PolicyTargetHybridTail()) {
+        // Reshape the floored (N'=1) tail by the policy-post-processing harmonic
+        // value-softmax over the tail moves' QM, conserving the tail mass; the
+        // high-visit head is untouched. Mirrors the pp kernel below, restricted
+        // to the floored set.
+        double qm_max_tail = -std::numeric_limits<double>::infinity();
+        double tail_budget = 0.0;
+        int n_tail = 0;
+        for (size_t i = 0; i < visits.size(); ++i) {
+          if (!floored[i]) continue;
+          ++n_tail;
+          tail_budget += pruned[i];
+          qm_max_tail = std::max(qm_max_tail, std::get<2>(visits[i]));
+        }
+        if (n_tail >= 2 && tail_budget > 0.0) {
+          const double vwt =
+              1.0 / params_.GetPolicyPostProcessingWeightTemperature();
+          double w_sum = 0.0;
+          std::vector<double> w(visits.size(), 0.0);
+          for (size_t i = 0; i < visits.size(); ++i) {
+            if (!floored[i]) continue;
+            w[i] = std::exp(vwt * (std::get<2>(visits[i]) - qm_max_tail));
+            w_sum += w[i];
+          }
+          double mean_qm = 0.0;
+          for (size_t i = 0; i < visits.size(); ++i) {
+            if (floored[i]) mean_qm += (w[i] / w_sum) * std::get<2>(visits[i]);
+          }
+          double var = 0.0;
+          for (size_t i = 0; i < visits.size(); ++i) {
+            if (!floored[i]) continue;
+            const double diff = std::get<2>(visits[i]) - mean_qm;
+            var += (w[i] / w_sum) * diff * diff;
+          }
+          var = std::max(var, 1e-9);
+          const double alpha =
+              params_.GetPolicyPostProcessingUtilityAlpha() * std::sqrt(var);
+          double kern_sum = 0.0;
+          std::vector<double> kern(visits.size(), 0.0);
+          for (size_t i = 0; i < visits.size(); ++i) {
+            if (!floored[i]) continue;
+            kern[i] = 1.0 / (alpha + qm_max_tail - std::get<2>(visits[i]));
+            kern_sum += kern[i];
+          }
+          for (size_t i = 0; i < visits.size(); ++i) {
+            if (floored[i]) pruned[i] = tail_budget * kern[i] / kern_sum;
+          }
+        }
+      }
+
+      // Assemble: visited moves share the network's visited-policy mass by
+      // de-forced visit count, unvisited moves keep their prior — identical
+      // bookkeeping to the raw-visit path below.
+      std::vector<std::tuple<float, float>> pruned_dist;
+      pruned_dist.reserve(legal_moves.size());
+      std::vector<size_t> edge_idx_of_legal;
+      edge_idx_of_legal.reserve(legal_moves.size());
+      const float policy_temp_k2 = params_.GetPolicySoftmaxTemp();
+      auto piter = nneval->p.begin();
+      float policy_sum = 0.0f;
+      double N_sum = 0.0;
+      for (const auto& move : legal_moves) {
+        auto pos = std::find_if(
+            visits.begin(), visits.end(),
+            [&move](const auto& m) { return std::get<0>(m) == move; });
+        if (pos == visits.end()) {
+          throw Exception("Legal moves don't match the root node.");
+        }
+        if (piter == nneval->p.end()) {
+          throw Exception("Not enough policy values returned by the network.");
+        }
+        const double N = pruned[pos - visits.begin()];
+        const float nn_policy = std::pow(*piter++, policy_temp_k2);
+        policy_sum += nn_policy;
+        pruned_dist.emplace_back(static_cast<float>(N), nn_policy);
+        edge_idx_of_legal.push_back(
+            static_cast<size_t>(pos - visits.begin()));
+        N_sum += N;
+      }
+      double visited_pol = 0.0;
+      for (auto& [N, nn_policy] : pruned_dist) {
+        nn_policy /= policy_sum;
+        if (N != 0) visited_pol += nn_policy;
+      }
+      for (auto& [N, nn_policy] : pruned_dist) {
+        if (N != 0) {
+          N = static_cast<float>(visited_pol * N / N_sum);
+        } else {
+          N = nn_policy;
+        }
+      }
+      // Blend the assembled hybrid target with a value-sharp factor and an
+      // optional directional draw-steer term:
+      //   target ~ hybrid^lambda * (P*exp(-dLoss/tau))^(1-lambda)
+      //            * exp(beta*dD/tauD),  beta = -beta0*tanh(rootQ/0.3)
+      // Loss prob L=(1-D-Q)/2 per visited move; unvisited moves take a flat
+      // 0.5 loss-gap penalty and no steer (mirrors the offline reference
+      // implementation the sweep was run on).
+      const float blend_lambda = params_.GetPolicyTargetBlendLambda();
+      if (blend_lambda > 0.0f) {
+        const float tau = params_.GetPolicyTargetBlendTau();
+        const float ds_beta0 = params_.GetPolicyTargetDrawSteerBeta();
+        const float ds_taud = params_.GetPolicyTargetDrawSteerTauD();
+        const float unvisited_gap = params_.GetPolicyTargetUnvisitedGap();
+        const size_t n_legal = legal_moves.size();
+        std::vector<float> lossp(n_legal, -1.0f);
+        float lmin = std::numeric_limits<float>::max();
+        double sum_n = 0.0, root_q = 0.0, root_d = 0.0;
+        for (size_t k = 0; k < n_legal; ++k) {
+          const size_t idx = edge_idx_of_legal[k];
+          const uint32_t n_raw = std::get<1>(visits[idx]);
+          if (n_raw == 0) continue;
+          const float q = edge_q[idx];
+          const float d = edge_d[idx];
+          lossp[k] = 0.5f * (1.0f - d - q);
+          lmin = std::min(lmin, lossp[k]);
+          sum_n += n_raw;
+          root_q += static_cast<double>(q) * n_raw;
+          root_d += static_cast<double>(d) * n_raw;
+        }
+        if (sum_n > 0.0) {
+          root_q /= sum_n;
+          root_d /= sum_n;
+        }
+        const float beta =
+            -ds_beta0 * std::tanh(static_cast<float>(root_q) / 0.3f);
+        double tsum = 0.0;
+        std::vector<float> blended(n_legal, 0.0f);
+        for (size_t k = 0; k < n_legal; ++k) {
+          const float hybrid = std::get<0>(pruned_dist[k]);
+          const float p_norm = std::get<1>(pruned_dist[k]);
+          const float gap =
+              lossp[k] >= 0.0f ? lossp[k] - lmin : unvisited_gap;
+          const float sharp = p_norm * std::exp(-gap / tau);
+          float steer = 1.0f;
+          if (ds_beta0 > 0.0f && lossp[k] >= 0.0f) {
+            const float dd =
+                edge_d[edge_idx_of_legal[k]] - static_cast<float>(root_d);
+            steer = std::exp(beta * dd / ds_taud);
+          }
+          blended[k] = std::pow(std::max(hybrid, 1e-12f), blend_lambda) *
+                       std::pow(std::max(sharp, 1e-12f), 1.0f - blend_lambda) *
+                       steer;
+          tsum += blended[k];
+        }
+        if (tsum > 0.0) {
+          for (size_t k = 0; k < n_legal; ++k) {
+            std::get<0>(pruned_dist[k]) =
+                static_cast<float>(blended[k] / tsum);
+          }
+        }
+      }
+
+      // Ordered tail insurance. See Search::ApplyOrderedTailInsurance.
+      const float tail_eps = params_.GetPolicyTargetTailEps();
+      const float tail_tau_used = ApplyOrderedTailInsurance(
+          &pruned_dist, legal_moves, edge_idx_of_legal, visits, edge_q, edge_d);
+
+      // Test hook: echo the final assembled k2/hybrid target per legal move so
+      // an external checker can validate the whole pipeline (LC0_K2_DEBUG=<path>).
+      static const char* k2_debug = std::getenv("LC0_K2_DEBUG");
+      if (k2_debug) {
+        static std::mutex k2_mutex;
+        std::lock_guard<std::mutex> guard(k2_mutex);
+        std::ofstream f(k2_debug, std::ios::app);
+        float min_target = 1.0f;
+        int unvisited = 0;
+        for (size_t k = 0; k < legal_moves.size(); ++k) {
+          min_target = std::min(min_target, std::get<0>(pruned_dist[k]));
+          if (std::get<1>(visits[edge_idx_of_legal[k]]) == 0) ++unvisited;
+        }
+        f << std::setprecision(17) << "{\"policy_temp\":" << policy_temp_k2
+          << ",\"hybrid\":" << (params_.PolicyTargetHybridTail() ? 1 : 0)
+          << ",\"tail_eps\":" << tail_eps
+          << ",\"tail_tau\":" << tail_tau_used
+          << ",\"min_target\":" << min_target
+          << ",\"n_legal\":" << legal_moves.size()
+          << ",\"n_unvisited\":" << unvisited
+          << ",\"moves\":[";
+        for (size_t k = 0; k < legal_moves.size(); ++k) {
+          // prior_raw is nneval->p as the SEARCH consumed it (the backend has
+          // already applied PST). The V8 record stores renorm(p^PST), so
+          // `stored_prior^(1/pst)` renormalised must reproduce this -- the
+          // round-trip SPEC_v8_recipe_block_0902.md §6.3 asks for.
+          f << (k ? "," : "") << "{\"uci\":\"" << legal_moves[k].ToString(true)
+            << "\",\"target\":" << std::get<0>(pruned_dist[k])
+            << ",\"prior_raw\":" << (k < nneval->p.size() ? nneval->p[k] : -1.0f)
+            << "}";
+        }
+        f << "]}\n";
+      }
+      return pruned_dist;
+    }
+  }
+
+  // Every remaining exit path assembles its target in `legal_moves` order, so
+  // one mapping serves them all. Built lazily: the k2 branch above has its own
+  // and never reaches here.
+  auto insure = [&](std::vector<std::tuple<float, float>> d) {
+    if (params_.GetPolicyTargetTailEps() <= 0.0f) return d;
+    std::vector<size_t> edge_idx_of_legal;
+    edge_idx_of_legal.reserve(legal_moves.size());
+    for (const auto& move : legal_moves) {
+      auto pos = std::find_if(
+          visits.begin(), visits.end(),
+          [&move](const auto& m) { return std::get<0>(m) == move; });
+      if (pos == visits.end()) {
+        throw Exception("Legal moves don't match the root node.");
+      }
+      edge_idx_of_legal.push_back(static_cast<size_t>(pos - visits.begin()));
+    }
+    ApplyOrderedTailInsurance(&d, legal_moves, edge_idx_of_legal, visits,
+                              edge_q, edge_d);
+    return d;
+  };
+
+  if (params_.UsePolicyTargetGrill9() && nneval) {
+    auto grill9 = ComputeGrill9Target(
+        visits, legal_moves, nneval->p, params_.GetPolicySoftmaxTemp(),
+        params_.GetGrill9AtanhScale(), params_.GetGrill9VisitBlend());
+    // C11: grill9 used to return here, before the insurance block, which made
+    // the combination unreachable by flags. cv4-B is exactly that cell.
+    if (!grill9.empty()) return insure(std::move(grill9));
+    // Degenerate input (e.g. zero playouts): fall through to legacy target.
+  }
 
   // Use Softmax weighted variance to measure the spread of the move values.
   // Alpha will be scaled based on the variance.
@@ -899,7 +1749,10 @@ std::vector<std::tuple<float, float>> Search::GetVisitDistribution(
     }
   }
 
-  return distribution;
+  // C10: this is the path taken when forced exploration is off, and it is
+  // precisely then that the unvisited class stops being empty and the
+  // insurance is the only thing covering it.
+  return insure(std::move(distribution));
 }
 
 void Search::ResetBestMove() {
@@ -2159,6 +3012,20 @@ bool SearchWorker::PickNodesToExtendTask(
           }
         }
         if (best_idx == -1) {
+          // Nothing selectable in this scan. Happens when the root move filter
+          // (syzygy) excludes every edge the forced-visit resume still had to
+          // look at — the filter's `continue` above skips the "last child"
+          // handling that would normally pick a fallback, so no candidate is
+          // ever set. Two things must happen, or the search breaks:
+          //  - the outstanding in-flight visits must be returned, exactly as
+          //    the forced-visit "stop node picking" branch does; leaving them
+          //    in flight makes the search wait on visits that never arrive
+          //    (livelock: 100% CPU, 0% GPU, no games written);
+          //  - picking must stop before the code below indexes
+          //    visits_to_perform at -1, which writes into the heap chunk's
+          //    own malloc header (free(): invalid next size).
+          node->CancelScoreUpdate(cur_limit);
+          cur_limit = 0;
           break;
         }
         if (second_best_edge) {

@@ -27,6 +27,16 @@
 
 #pragma once
 
+#include <atomic>
+#include <cstddef>
+#include <memory>
+#include <new>
+#include <string>
+#include <type_traits>
+#include <utility>
+
+#include "utils/exception.h"
+
 namespace lczero {
 
 template <typename T>
@@ -46,7 +56,13 @@ class AtomicVector {
   template <typename... Args>
   size_t emplace_back(Args&&... args) {
     size_t i = size_.fetch_add(1, std::memory_order_relaxed);
-    assert(i < capacity_);
+    if (i >= capacity_) {
+      // Give the slot back so that size() stays within capacity and the
+      // elements that were constructed are still destroyed exactly once.
+      size_.fetch_sub(1, std::memory_order_relaxed);
+      throw Exception("AtomicVector overflow: capacity is " +
+                      std::to_string(capacity_) + ".");
+    }
     new (&data_[i]) T(std::forward<Args>(args)...);
     return i;
   }
@@ -61,7 +77,12 @@ class AtomicVector {
     return *reinterpret_cast<const T*>(&data_[i]);
   }
 
-  size_t size() const { return size_.load(std::memory_order_relaxed); }
+  size_t size() const {
+    // A concurrent overflow can leave the counter transiently above capacity;
+    // never report more elements than were actually constructed.
+    const size_t size = size_.load(std::memory_order_relaxed);
+    return size < capacity_ ? size : capacity_;
+  }
   size_t capacity() const { return capacity_; }
 
   // Not thread safe.

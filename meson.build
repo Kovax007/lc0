@@ -122,6 +122,27 @@ files += gen.process('proto/onnx.proto',
 files += gen.process('proto/hlo.proto',
   preserve_path_from : meson.current_source_dir())
 
+if get_option('lc0ex-runtime')
+  files += gen.process('proto/lc0ex.proto',
+    preserve_path_from : meson.current_source_dir())
+  files += gen.process('proto/lc0ex_metadata.proto',
+    preserve_path_from : meson.current_source_dir())
+
+  cu_driver = cc.find_library('cuda', required: true)
+  deps += cu_driver
+
+  foreach d : get_option('cudnn_include')
+    if run_command('scripts/checkdir.py', d, check : false).returncode() == 0
+      includes += include_directories(d, is_system: true)
+    endif
+  endforeach
+
+  files += 'src/neural/backends/lc0ex-cuda/runtime/lc0ex_cuda.cc'
+  files += 'src/neural/backends/lc0ex-cuda/network_fingerprint.cc'
+  files += 'src/neural/backends/lc0ex-cuda/network_lc0ex_cuda.cc'
+  has_backends = true
+endif
+
 #############################################################################
 ## Main files
 #############################################################################
@@ -131,6 +152,7 @@ common_files += [
   'src/chess/position.cc',
   'src/chess/uciloop.cc',
   'src/neural/backend.cc',
+  'src/neural/batchmerge.cc',
   'src/neural/batchsplit.cc',
   'src/neural/decoder.cc',
   'src/neural/encoder.cc',
@@ -160,6 +182,7 @@ files += [
   'src/engine_loop.cc',
   'src/engine.cc',
   'src/neural/backends/network_check.cc',
+  'src/neural/backends/backend_multi.cc',
   'src/neural/backends/network_demux.cc',
   'src/neural/backends/network_mux.cc',
   'src/neural/backends/network_random.cc',
@@ -192,6 +215,7 @@ files += [
   'src/selfplay/multigame.cc',
   'src/selfplay/tournament.cc',
   'src/tools/backendbench.cc',
+  'src/tools/backendcompare.cc',
   'src/tools/benchmark.cc',
   'src/tools/describenet.cc',
   'src/tools/leela2onnx.cc',

@@ -1,6 +1,6 @@
 /*
   This file is part of Leela Chess Zero.
-  Copyright (C) 2024 The LCZero Authors
+  Copyright (C) 2026 The LCZero Authors
 
   Leela Chess is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -9,11 +9,11 @@
 
   Leela Chess is distributed in the hope that it will be useful,
   but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
   GNU General Public License for more details.
 
   You should have received a copy of the GNU General Public License
-  along with Leela Chess.  If not, see <http://www.gnu.org/licenses/>.
+  along with Leela Chess. If not, see <http://www.gnu.org/licenses/>.
 
   Additional permission under GNU GPL version 3 section 7
 
@@ -27,31 +27,14 @@
 
 #pragma once
 
-#include "utils/optionsdict.h"
-#include "utils/optionsparser.h"
+#include "proto/net.pb.h"
 
 namespace lczero {
+namespace lc0ex {
 
-// Backend parameters that appear in UCI interface and are in use by most
-// backends.
-struct SharedBackendParams {
-  static const constexpr char* kEmbed = "<built in>";
-  static const constexpr char* kAutoDiscover = "<autodiscover>";
+// Builds the sparse architecture fingerprint stored in an lc0ex executable.
+// The input is expected to have undergone LC0's usual network normalization.
+pblczero::Net BuildNetworkFingerprint(const pblczero::Net& network);
 
-  static const OptionId kPolicySoftmaxTemp;
-  static const OptionId kHistoryFill;
-  static const OptionId kWeightsId;
-  static const OptionId kBackendId;
-  static const OptionId kBackendOptionsId;
-  static const OptionId kNNCacheSizeId;
-  static const OptionId kBatchMergeMaxBatch;
-  static const OptionId kBatchMergeWaitUs;
-  static const OptionId kBatchMergeThreads;
-
-  static void Populate(OptionsParser*);
-
- private:
-  SharedBackendParams() = delete;
-};
-
+}  // namespace lc0ex
 }  // namespace lczero

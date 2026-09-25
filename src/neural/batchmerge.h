@@ -1,6 +1,6 @@
 /*
   This file is part of Leela Chess Zero.
-  Copyright (C) 2018-2021 The LCZero Authors
+  Copyright (C) 2026 The LCZero Authors
 
   Leela Chess is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -27,42 +27,30 @@
 
 #pragma once
 
-#include <fstream>
-#include <zlib.h>
+#include <memory>
+
+#include "neural/backend.h"
+#include "utils/optionsdict.h"
 
 namespace lczero {
 
-struct V6TrainingData;
-struct V7TrainingData;
-struct V8TrainingData;
+// Creates a backend wrapper that merges the batches of concurrent callers into
+// a single parent computation, the way the legacy `multiplexing` network does
+// for old-API networks. Selfplay evaluates one small batch per game thread —
+// mean NN batch 11 with 24 games — which leaves every kernel latency-bound and
+// re-reads the whole weight set per evaluation. Merging trades a little
+// per-game latency, which datagen does not care about, for a batch the GPU can
+// actually fill.
+//
+// `max_batch` caps the merged batch. `wait_us` is how long a worker lingers for
+// more work before running a batch it could already run; 0 runs immediately.
+// `threads` is the number of merging workers.
+std::unique_ptr<Backend> CreateBatchMergingBackend(
+    std::unique_ptr<Backend> parent, int max_batch, int wait_us, int threads);
 
-class TrainingDataWriter {
- public:
-  // Creates a new file to write in data directory. It will has @game_id
-  // somewhere in the filename.
-  TrainingDataWriter(int game_id);
-  TrainingDataWriter(std::string filename);
-
-  ~TrainingDataWriter() {
-    if (fout_) Finalize();
-  }
-
-  // Writes a chunk. There is a separate overload per record version on
-  // purpose: the body uses sizeof() on the STATIC type, so a single
-  // V6-typed entry point would silently truncate a V7 record to 8356 bytes.
-  void WriteChunk(const V6TrainingData& data);
-  void WriteChunk(const V7TrainingData& data);
-  void WriteChunk(const V8TrainingData& data);
-
-  // Flushes file and closes it.
-  void Finalize();
-
-  // Gets full filename of the file written.
-  std::string GetFileName() const { return filename_; }
-
- private:
-  std::string filename_;
-  gzFile fout_;
-};
+// Wraps `parent` according to the shared backend options, or returns it
+// unchanged when batch merging is switched off (the default).
+std::unique_ptr<Backend> MaybeWrapWithBatchMerging(
+    std::unique_ptr<Backend> parent, const OptionsDict& opts);
 
 }  // namespace lczero

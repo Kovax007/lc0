@@ -638,7 +638,10 @@ class CudaNetwork : public Network {
       comp.AddInput(InputPlanes{(size_t)kNumInputPlanes});
       // Make sure cublas is initialized in this thread.
       comp.ComputeBlocking();
-      for (int i = 0; i < GetMiniBatchSize(); i++) {
+      // Never walk past max_batch_size_: forwardEval would copy past the end of
+      // the InputsOutputs buffers and cuda_graphs_ would be indexed out of range.
+      for (int i = 0; i < std::min(GetMiniBatchSize(), max_batch_size_ - 1);
+           i++) {
         comp.AddInput(InputPlanes{(size_t)kNumInputPlanes});
         auto lock = LockEval();
         comp.CaptureGraph(std::move(lock));
@@ -1039,8 +1042,9 @@ class CudaNetwork : public Network {
   }
 
   int GetMiniBatchSize() const override {
-    // Simple heuristic that seems to work for a wide range of GPUs.
-    return 2 * sm_count_;
+    // Simple heuristic that seems to work for a wide range of GPUs, but never
+    // advertise more than the buffers were allocated for.
+    return std::min(2 * sm_count_, max_batch_size_);
   }
 
   int GetPreferredBatchStep() const override {

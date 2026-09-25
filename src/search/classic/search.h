@@ -41,6 +41,7 @@
 #include "search/classic/params.h"
 #include "search/classic/stoppers/timemgr.h"
 #include "syzygy/syzygy.h"
+#include "trainingdata/childdata.h"
 #include "utils/logging.h"
 #include "utils/mutex.h"
 
@@ -98,6 +99,25 @@ class Search {
   std::vector<std::tuple<float, float>> GetVisitDistribution(
       const std::vector<Move>& legal_moves) const;
 
+  // Per-root-child search data for the V8 training record: prior, Q/D/M,
+  // raw and de-forced visit counts, and the best reply below each child.
+  // Aligned with `legal_moves`, exactly like GetVisitDistribution's result.
+  // Independent of which policy-target kernel is selected -- see
+  // trainingdata/childdata.h.
+  RootSearchData GetRootChildData(const std::vector<Move>& legal_moves) const;
+
+  // Applies the ordered tail insurance to an assembled policy target (in
+  // `legal_moves` order), whatever kernel produced it. Returns the tau used.
+  // Public only because it is the single implementation shared by every
+  // target path; callers outside GetVisitDistribution are not expected.
+  float ApplyOrderedTailInsurance(
+      std::vector<std::tuple<float, float>>* dist,
+      const std::vector<Move>& legal_moves,
+      const std::vector<size_t>& edge_idx_of_legal,
+      const std::vector<std::tuple<Move, uint32_t, double>>& visits,
+      const std::vector<float>& edge_q,
+      const std::vector<float>& edge_d) const;
+
  private:
   // Computes the best move, maybe with temperature (according to the settings).
   void EnsureBestMoveKnown();
@@ -109,6 +129,18 @@ class Search {
   std::vector<EdgeAndNode> GetBestChildrenNoTemperature(Node* parent, int count,
                                                         int depth) const;
   EdgeAndNode GetBestRootChildWithTemperature(float temperature) const;
+
+  // KataGo forced-then-prune for the policy training target. Returns per-edge
+  // visit counts (in root-edge iteration order, matching GetVisitDistribution's
+  // `visits`) with forced-exploration / Dirichlet excess removed, by inverting
+  // the PUCT equation exactly as GetBestRootChildWithTemperature does for move
+  // selection. `clean_prior` (edge order) replaces edge.GetP() when non-null
+  // (removes Dirichlet-driven excess); pass nullptr for the noised edge prior.
+  // If `floored` is non-null it is filled with, per edge, whether the edge was
+  // pinned to the N'=1 floor (its low-visit tail is otherwise arbitrary).
+  std::vector<double> DeforcedVisits(
+      const std::vector<float>* clean_prior,
+      std::vector<bool>* floored) const;
 
   int64_t GetTimeSinceStart() const;
   int64_t GetTimeSinceFirstBatch() const;

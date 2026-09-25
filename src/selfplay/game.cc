@@ -84,9 +84,16 @@ SelfPlayGame::SelfPlayGame(PlayerOptions white, PlayerOptions black,
     : options_{white, black},
       chess960_{white.uci_options->Get<bool>(kUciChess960) ||
                 black.uci_options->Get<bool>(kUciChess960)},
-      training_data_(classic::SearchParams(*white.uci_options).GetHistoryFill(),
-                     classic::SearchParams(*black.uci_options).GetHistoryFill(),
-                     pblczero::NetworkFormat::INPUT_CLASSICAL_112_PLANE) {
+      training_data_(
+          classic::SearchParams(*white.uci_options).GetHistoryFill(),
+          classic::SearchParams(*black.uci_options).GetHistoryFill(),
+          pblczero::NetworkFormat::INPUT_CLASSICAL_112_PLANE,
+          classic::SearchParams(*white.uci_options).GetTrainingDataV7(),
+          classic::SearchParams(*white.uci_options).GetTrainingDataChildQ(),
+          classic::SearchParams(*white.uci_options)
+              .GetTrainingDataChildQMinVisits(),
+          classic::SearchParams(*white.uci_options).GetTrainingDataV8(),
+          classic::SearchParams(*white.uci_options).GetTrainingDataRecipeId()) {
   orig_fen_ = opening.start_fen;
   tree_[0] = std::make_shared<classic::NodeTree>();
   tree_[0]->ResetToPosition(orig_fen_, {});
@@ -132,17 +139,13 @@ void SelfPlayGame::Play(int white_threads, int black_threads, bool training,
                         SyzygyTablebase* syzygy_tb, bool enable_resign) {
   bool blacks_move = tree_[0]->IsBlackToMove();
 
-  // Take syzygy tablebases from player1 options.
-  std::string tb_paths =
-      options_[0].uci_options->Get<std::string>(kSyzygyTablebaseId);
-  if (!tb_paths.empty()) {  // && tb_paths != tb_paths_) {
-    syzygy_tb_ = std::make_unique<SyzygyTablebase>();
-    CERR << "Loading Syzygy tablebases from " << tb_paths;
-    if (!syzygy_tb_->init(tb_paths)) {
-      CERR << "Failed to load Syzygy tablebases!";
-      syzygy_tb_ = nullptr;
-    }
-  }
+  // The tournament-level tablebase (the syzygy_tb parameter, used by every
+  // Search created below) is the only instance that is ever probed. The
+  // per-game SyzygyTablebase re-init that used to live here was dead weight —
+  // its object was never probed — and re-initializing a tablebase (145 mmaps
+  // + entry allocations) concurrently from every starting game at high
+  // parallelism corrupted the heap (reproducible free(): invalid next size
+  // within minutes at --parallelism=24 with --syzygy-paths set).
   // Do moves while not end of the game. (And while not abort_)
   while (!abort_) {
     game_result_ = tree_[0]->GetPositionHistory().ComputeGameResult();
@@ -169,10 +172,29 @@ void SelfPlayGame::Play(int white_threads, int black_threads, bool training,
           std::make_unique<CallbackUciResponder>(
               options_[idx].best_move_callback, options_[idx].info_callback);
 
+      // Disable the syzygy ROOT-move filter: when the position is within
+      // tablebase range, hand the search all legal moves as `searchmoves`.
+      // MakeRootMoveFilter treats a non-empty searchmoves list as an override
+      // (search.cc "Search moves overrides tablebase"), so the root filter that
+      // would otherwise delete TB-losing moves from the search — leaking the raw
+      // prior into the policy target — is bypassed. Interior WDL adjudication is
+      // unaffected (root_is_in_dtz_ stays false). The only thing given up is DTZ
+      // root forcing on deep wins; the <=7-man value rescore restores those.
+      MoveList root_filter;
+      {
+        const auto& board =
+            tree_[idx]->GetPositionHistory().Last().GetBoard();
+        if (syzygy_tb &&
+            static_cast<int>((board.ours() | board.theirs()).count()) <=
+                syzygy_tb->max_cardinality()) {
+          root_filter = board.GenerateLegalMoves();
+        }
+      }
       search_ = std::make_unique<classic::Search>(
           *tree_[idx], options_[idx].backend, std::move(responder),
-          /* searchmoves */ MoveList(), std::chrono::steady_clock::now(),
-          std::move(stoppers), /* infinite */ false, /* ponder */ false,
+          /* searchmoves */ root_filter,
+          std::chrono::steady_clock::now(), std::move(stoppers),
+          /* infinite */ false, /* ponder */ false,
           *options_[idx].uci_options, syzygy_tb);
     }
 
@@ -195,39 +217,6 @@ void SelfPlayGame::Play(int white_threads, int black_threads, bool training,
     max_eval_[0] = std::max(max_eval_[0], blacks_move ? best_l : best_w);
     max_eval_[1] = std::max(max_eval_[1], best_d);
     max_eval_[2] = std::max(max_eval_[2], blacks_move ? best_w : best_l);
-    if (enable_resign && move_number >= options_[idx].uci_options->Get<int>(
-                                            kResignEarliestMoveId)) {
-      const float resignpct =
-          options_[idx].uci_options->Get<float>(kResignPercentageId) / 100;
-      if (options_[idx].uci_options->Get<bool>(kResignWDLStyleId)) {
-        auto threshold = 1.0f - resignpct;
-        if (best_w > threshold) {
-          game_result_ =
-              blacks_move ? GameResult::BLACK_WON : GameResult::WHITE_WON;
-          adjudicated_ = true;
-          break;
-        }
-        if (best_l > threshold) {
-          game_result_ =
-              blacks_move ? GameResult::WHITE_WON : GameResult::BLACK_WON;
-          adjudicated_ = true;
-          break;
-        }
-        if (best_d > threshold) {
-          game_result_ = GameResult::DRAW;
-          adjudicated_ = true;
-          break;
-        }
-      } else {
-        if (eval < resignpct) {  // always false when resignpct == 0
-          game_result_ =
-              blacks_move ? GameResult::WHITE_WON : GameResult::BLACK_WON;
-          adjudicated_ = true;
-          break;
-        }
-      }
-    }
-
     auto node = tree_[idx]->GetCurrentHead();
     classic::Eval played_eval = best_eval;
     Move move;
@@ -290,10 +279,55 @@ void SelfPlayGame::Play(int white_threads, int black_threads, bool training,
       std::optional<EvalResult> nneval =
           options_[idx].backend->GetCachedEvaluation(EvalPosition{
               tree_[idx]->GetPositionHistory().GetPositions(), legal_moves});
+      // The per-child search data for the V8 block. Collected only when V8 is
+      // on: it walks the root edges (and one ply below them) a second time,
+      // which is free per played move but not free per playout.
+      std::optional<RootSearchData> root_data;
+      if (classic::SearchParams(*options_[idx].uci_options)
+              .GetTrainingDataV8()) {
+        root_data = search_->GetRootChildData(legal_moves);
+      }
       training_data_.Add(tree_[idx]->GetCurrentHead(),
                          tree_[idx]->GetPositionHistory(), best_eval,
                          played_eval, best_is_proof, best_move, move,
-                         root_visits, legal_moves, nneval);
+                         root_visits, legal_moves, nneval,
+                         root_data ? &*root_data : nullptr);
+    }
+
+    // Adjudication happens after the training frame is appended so the
+    // position whose search holds the proven evaluation (e.g. a found mate)
+    // is included in the game record (upstream PR #2429).
+    if (enable_resign && move_number >= options_[idx].uci_options->Get<int>(
+                                            kResignEarliestMoveId)) {
+      const float resignpct =
+          options_[idx].uci_options->Get<float>(kResignPercentageId) / 100;
+      if (options_[idx].uci_options->Get<bool>(kResignWDLStyleId)) {
+        auto threshold = 1.0f - resignpct;
+        if (best_w > threshold) {
+          game_result_ =
+              blacks_move ? GameResult::BLACK_WON : GameResult::WHITE_WON;
+          adjudicated_ = true;
+          break;
+        }
+        if (best_l > threshold) {
+          game_result_ =
+              blacks_move ? GameResult::WHITE_WON : GameResult::BLACK_WON;
+          adjudicated_ = true;
+          break;
+        }
+        if (best_d > threshold) {
+          game_result_ = GameResult::DRAW;
+          adjudicated_ = true;
+          break;
+        }
+      } else {
+        if (eval < resignpct) {  // always false when resignpct == 0
+          game_result_ =
+              blacks_move ? GameResult::WHITE_WON : GameResult::BLACK_WON;
+          adjudicated_ = true;
+          break;
+        }
+      }
     }
     // Must reset the search before mutating the tree.
     search_.reset();

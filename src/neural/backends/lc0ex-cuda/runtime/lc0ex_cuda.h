@@ -1,6 +1,6 @@
 /*
   This file is part of Leela Chess Zero.
-  Copyright (C) 2018-2021 The LCZero Authors
+  Copyright (C) 2026 The LCZero Authors
 
   Leela Chess is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -27,42 +27,23 @@
 
 #pragma once
 
-#include <fstream>
-#include <zlib.h>
+#include "runtime.h"
 
 namespace lczero {
+namespace lc0ex {
 
-struct V6TrainingData;
-struct V7TrainingData;
-struct V8TrainingData;
+// How an Execution issues its kernel launch loop.
+//   kOff    - a plain launch loop, one cuLaunchKernel per node.
+//   kDag    - upstream's behaviour: a CUDA graph whose edges are the node
+//             dependencies, so independent kernels may run concurrently.
+//   kLinear - stream capture of the plain launch loop into a linear graph:
+//             the launch-overhead saving without the cross-kernel concurrency.
+// R22 measured kDag at +25 % with one execution slot in flight and -9 % with
+// two, so the choice has to be made by the caller, not baked in.
+enum class GraphMode { kOff, kDag, kLinear };
 
-class TrainingDataWriter {
- public:
-  // Creates a new file to write in data directory. It will has @game_id
-  // somewhere in the filename.
-  TrainingDataWriter(int game_id);
-  TrainingDataWriter(std::string filename);
+std::unique_ptr<Runtime> CreateLc0exCudaRuntime(
+    int device_ordinal = 0, GraphMode graph_mode = GraphMode::kDag);
 
-  ~TrainingDataWriter() {
-    if (fout_) Finalize();
-  }
-
-  // Writes a chunk. There is a separate overload per record version on
-  // purpose: the body uses sizeof() on the STATIC type, so a single
-  // V6-typed entry point would silently truncate a V7 record to 8356 bytes.
-  void WriteChunk(const V6TrainingData& data);
-  void WriteChunk(const V7TrainingData& data);
-  void WriteChunk(const V8TrainingData& data);
-
-  // Flushes file and closes it.
-  void Finalize();
-
-  // Gets full filename of the file written.
-  std::string GetFileName() const { return filename_; }
-
- private:
-  std::string filename_;
-  gzFile fout_;
-};
-
+}  // namespace lc0ex
 }  // namespace lczero

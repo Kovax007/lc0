@@ -74,6 +74,22 @@ void TrainingDataWriter::WriteChunk(const V6TrainingData& data) {
   }
 }
 
+void TrainingDataWriter::WriteChunk(const V7TrainingData& data) {
+  auto bytes_written =
+      gzwrite(fout_, reinterpret_cast<const char*>(&data), sizeof(data));
+  if (bytes_written != sizeof(data)) {
+    throw Exception("Unable to write into " + filename_);
+  }
+}
+
+void TrainingDataWriter::WriteChunk(const V8TrainingData& data) {
+  auto bytes_written =
+      gzwrite(fout_, reinterpret_cast<const char*>(&data), sizeof(data));
+  if (bytes_written != sizeof(data)) {
+    throw Exception("Unable to write into " + filename_);
+  }
+}
+
 void TrainingDataWriter::Finalize() {
   gzclose(fout_);
   fout_ = nullptr;
