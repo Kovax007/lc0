@@ -122,6 +122,10 @@ class Network {
   virtual bool IsCpu() const { return false; }
   virtual int GetMiniBatchSize() const { return 256; }
   virtual int GetPreferredBatchStep() const { return 1; }
+  // The most positions one computation may hold. NetworkAsBackend used to
+  // hard-code 1024; a network that can only run smaller batches (or a test
+  // that needs a small one) overrides this.
+  virtual int GetMaximumBatchSize() const { return 1024; }
   virtual ~Network() = default;
 };
 

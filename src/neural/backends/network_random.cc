@@ -107,6 +107,10 @@ class RandomNetwork : public Network {
       : delay_ms_(options.GetOrDefault<int>("delay", 0)),
         seed_(options.GetOrDefault<int>("seed", 0)),
         uniform_mode_(options.GetOrDefault<bool>("uniform", false)),
+        // Test knob: a small maximum batch makes the search overrun the
+        // backend's capacity on CPU, which is how the fleet's
+        // "AtomicVector overflow: capacity is 64" is reproduced and gated.
+        max_batch_(options.GetOrDefault<int>("max_batch", 1024)),
         capabilities_{
             static_cast<pblczero::NetworkFormat::InputFormat>(
                 options.GetOrDefault<int>(
@@ -121,11 +125,13 @@ class RandomNetwork : public Network {
   const NetworkCapabilities& GetCapabilities() const override {
     return capabilities_;
   }
+  int GetMaximumBatchSize() const override { return max_batch_; }
 
  private:
   int delay_ms_ = 0;
   int seed_ = 0;
   bool uniform_mode_ = false;
+  int max_batch_ = 1024;
   NetworkCapabilities capabilities_{
       pblczero::NetworkFormat::INPUT_CLASSICAL_112_PLANE,
       pblczero::NetworkFormat::OUTPUT_WDL,

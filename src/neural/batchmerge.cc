@@ -124,8 +124,19 @@ class BatchMergingBackend : public Backend {
   BatchMergingBackend(std::unique_ptr<Backend> parent, int max_batch,
                       int wait_us, int threads)
       : parent_(std::move(parent)),
-        max_batch_(std::max(1, max_batch)),
+        // A merged batch is populated into ONE parent computation, whose
+        // capacity is the parent's maximum batch; packing past it would throw
+        // inside the parent. So the merge cap never exceeds that maximum
+        // (the fleet runs 64 on a 64-rung artifact: unchanged).
+        max_batch_(std::min(std::max(1, max_batch),
+                            std::max(1, parent_->GetAttributes()
+                                            .maximum_batch_size))),
         linger_(std::max(0, wait_us)) {
+    if (max_batch_ < static_cast<std::size_t>(max_batch)) {
+      CERR << "Batch merging: --batch-merge-max-batch=" << max_batch
+           << " exceeds the backend's maximum batch; using " << max_batch_
+           << ".";
+    }
     for (int i = 0; i < std::max(1, threads); ++i) {
       workers_.emplace_back([this]() { Worker(); });
     }
