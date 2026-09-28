@@ -39,13 +39,16 @@ std::vector<EvalResult> Backend::EvaluateBatch(
   std::vector<EvalResult> results;
   results.reserve(positions.size());
   std::unique_ptr<BackendComputation> computation = CreateComputation();
+  const bool has_childq = GetAttributes().has_childq;
   for (const EvalPosition& pos : positions) {
     results.emplace_back();
     EvalResult& result = results.back();
     result.p.resize(pos.legal_moves.size());
-    computation->AddInput(
-        pos, EvalResultPtr{&result.q, &result.d, &result.m,
-                           std::span<float>(result.p.data(), result.p.size())});
+    if (has_childq) {
+      result.cq.resize(pos.legal_moves.size());
+      result.cs.resize(pos.legal_moves.size());
+    }
+    computation->AddInput(pos, result.AsPtr());
   }
   computation->ComputeBlocking();
   return results;

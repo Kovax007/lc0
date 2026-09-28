@@ -58,6 +58,14 @@ class MuxingComputation : public NetworkComputation {
     return parent_->GetMVal(sample + idx_in_parent_);
   }
 
+  float GetChildQVal(int sample, int move_id) const override {
+    return parent_->GetChildQVal(sample + idx_in_parent_, move_id);
+  }
+
+  float GetChildSigmaVal(int sample, int move_id) const override {
+    return parent_->GetChildSigmaVal(sample + idx_in_parent_, move_id);
+  }
+
   float GetPVal(int sample, int move_id) const override {
     return parent_->GetPVal(sample + idx_in_parent_, move_id);
   }

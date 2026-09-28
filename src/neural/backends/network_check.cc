@@ -110,6 +110,14 @@ class CheckComputation : public NetworkComputation {
     return work_comp_->GetMVal(sample);
   }
 
+  float GetChildQVal(int sample, int move_id) const override {
+    return work_comp_->GetChildQVal(sample, move_id);
+  }
+
+  float GetChildSigmaVal(int sample, int move_id) const override {
+    return work_comp_->GetChildSigmaVal(sample, move_id);
+  }
+
   float GetPVal(int sample, int move_id) const override {
     return work_comp_->GetPVal(sample, move_id);
   }

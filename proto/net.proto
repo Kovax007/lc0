@@ -397,6 +397,10 @@ message OnnxModel {
   optional string output_wdl = 5;
   optional string output_policy = 6;
   optional string output_mlh = 7;
+  // Child-Q head, [batch, 1858] each in policy index order: the expected value
+  // of the child after each move (side-to-move frame) and its variance.
+  optional string output_childq_mean = 8;
+  optional string output_childq_var = 9;
 }
 
 message Net {

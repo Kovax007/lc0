@@ -60,6 +60,7 @@
 #include "utils/atomic_vector.h"
 #include "utils/exception.h"
 #include "utils/fastmath.h"
+#include "utils/fp16_utils.h"
 #include "utils/logging.h"
 
 namespace lczero {
@@ -71,6 +72,12 @@ constexpr std::string_view kInputValuesName = "/input/plane_values";
 constexpr std::string_view kOutputPolicyName = "/output/policy";
 constexpr std::string_view kOutputWdlName = "/output/wdl";
 constexpr std::string_view kOutputMlhName = "/output/mlh";
+// The child-Q head: raw per-policy-index mean and variance of the child's Q,
+// from the view of the side to move before the move. Both or neither.
+constexpr std::string_view kOutputChildQMeanName = "/output/childq_mean";
+constexpr std::string_view kOutputChildQVarName = "/output/childq_var";
+// A net carries the head's weights as ONNX initializers under this prefix.
+constexpr std::string_view kChildQInitializerPrefix = "/childq/";
 constexpr std::size_t kNumOutputPolicy = 1858;
 constexpr std::size_t kNumWdlOutputs = 3;
 
@@ -146,6 +153,12 @@ struct ProgramSpec {
   const lc0ex::BufferInfo* output_policy;
   const lc0ex::BufferInfo* output_wdl;
   const lc0ex::BufferInfo* output_mlh;
+  // Both null in an executable without the child-Q head.
+  const lc0ex::BufferInfo* output_childq_mean;
+  const lc0ex::BufferInfo* output_childq_var;
+  // The head's outputs may be F32 (the contract's default) or F16, halving their transfer; either way the
+  // search receives float32, converted per filled move.
+  bool childq_f16;
 };
 
 pblczero::NeuralExecutable LoadExecutableFile(const std::string& path) {
@@ -370,6 +383,14 @@ void UploadWeights(const WeightsFile& weights, lc0ex::Executable& executable,
   for (const auto& initializer : onnx.graph().initializer()) {
     const auto* buffer = executable.FindBuffer(initializer.name());
     if (!buffer) {
+      // A skipped child-Q weight would serve the net without its head.
+      if (std::string_view(initializer.name())
+              .starts_with(kChildQInitializerPrefix)) {
+        throw Exception("The child-Q initializer '" +
+                        std::string(initializer.name()) +
+                        "' has no corresponding lc0ex buffer: the executable "
+                        "was built without the head.");
+      }
       CERR << "WARNING: ONNX initializer '" << initializer.name()
            << "' has no corresponding lc0ex buffer.";
       continue;
@@ -476,6 +497,8 @@ class Lc0exCudaBackendComputation final : public BackendComputation {
   };
 
   void DecodePolicy(const Entry& entry, std::span<const float> logits) const;
+  void FillChildQ(const Entry& entry, std::span<const std::byte> means,
+                  std::span<const std::byte> variances, bool childq_f16) const;
 
   Lc0exCudaBackend* backend_;
   AtomicVector<Entry> entries_;
@@ -536,6 +559,9 @@ class Lc0exCudaBackend final : public Backend {
                  backend_options.GetOrDefault<std::string>("graph", "auto")));
     executable_ = runtime_->Load(executable_proto);
     InitializePrograms();
+    // The NN cache reads has_childq once, when it wraps this backend, and
+    // EvaluateBatch sizes the child-Q arrays from it: final before returning.
+    attributes_.has_childq = programs_.front().output_childq_mean != nullptr;
     UploadWeights(weights, *executable_, backend_options);
   }
 
@@ -719,8 +745,52 @@ class Lc0exCudaBackend final : public Backend {
             {batch_size, 1});
       }
 
+      const auto* output_childq_mean =
+          program->FindBuffer(kOutputChildQMeanName);
+      const auto* output_childq_var = program->FindBuffer(kOutputChildQVarName);
+      if ((output_childq_mean == nullptr) != (output_childq_var == nullptr)) {
+        throw Exception("The lc0ex program '" + program_info.name +
+                        "' has only one of the two child-Q output buffers.");
+      }
+      bool childq_f16 = false;
+      if (output_childq_mean) {
+        if (output_childq_mean->data_type != output_childq_var->data_type) {
+          throw Exception("The lc0ex program '" + program_info.name +
+                          "' declares its two child-Q outputs with different data types.");
+        }
+        childq_f16 =
+            output_childq_mean->data_type == pblczero::Buffer::DATA_TYPE_F16;
+        const auto childq_type = childq_f16 ? pblczero::Buffer::DATA_TYPE_F16
+                                            : pblczero::Buffer::DATA_TYPE_F32;
+        output_childq_mean = RequireProgramBuffer(
+            *program, kOutputChildQMeanName, childq_type,
+            {batch_size, kNumOutputPolicy});
+        output_childq_var = RequireProgramBuffer(
+            *program, kOutputChildQVarName, childq_type,
+            {batch_size, kNumOutputPolicy});
+      }
+
       programs_.push_back({batch_size, program, input_masks, input_values,
-                           output_policy, output_wdl, output_mlh});
+                           output_policy, output_wdl, output_mlh,
+                           output_childq_mean, output_childq_var, childq_f16});
+    }
+
+    const auto with_childq = std::count_if(
+        programs_.begin(), programs_.end(), [](const ProgramSpec& spec) {
+          return spec.output_childq_mean != nullptr;
+        });
+    if (with_childq != 0 &&
+        static_cast<std::size_t>(with_childq) != programs_.size()) {
+      throw Exception("Only " + std::to_string(with_childq) + " of the " +
+                      std::to_string(programs_.size()) +
+                      " lc0ex programs have the child-Q outputs.");
+    }
+    if (with_childq != 0 &&
+        !absl::c_all_of(programs_, [&](const ProgramSpec& spec) {
+          return spec.childq_f16 == programs_.front().childq_f16;
+        })) {
+      throw Exception(
+          "The lc0ex programs disagree on the child-Q output data type.");
     }
 
     std::sort(programs_.begin(), programs_.end(),
@@ -801,6 +871,33 @@ void Lc0exCudaBackendComputation::DecodePolicy(
   for (float& value : entry.result.p) value *= scale;
 }
 
+// The raw head rows in DecodePolicy's move order: no softmax, temperature or
+// renormalisation, and sigma from the variance, as FillChildQ in wrapper.cc
+// does for the onnx backends.
+void Lc0exCudaBackendComputation::FillChildQ(
+    const Entry& entry, std::span<const std::byte> means,
+    std::span<const std::byte> variances, bool childq_f16) const {
+  // Converted per filled move, not per row: ~26 values a sample instead of 1,858.
+  const auto value = [childq_f16](std::span<const std::byte> row,
+                                  std::size_t index) {
+    if (childq_f16) {
+      std::uint16_t half;
+      std::memcpy(&half, row.data() + index * sizeof(std::uint16_t),
+                  sizeof(half));
+      return FP16toFP32(half);
+    }
+    float single;
+    std::memcpy(&single, row.data() + index * sizeof(float), sizeof(single));
+    return single;
+  };
+  for (std::size_t i = 0; i < entry.legal_moves.size(); ++i) {
+    const std::size_t index =
+        MoveToNNIndex(entry.legal_moves[i], entry.transform);
+    entry.result.cq[i] = value(means, index);
+    entry.result.cs[i] = std::sqrt(std::max(value(variances, index), 0.0f));
+  }
+}
+
 void Lc0exCudaBackendComputation::ComputeBlocking() {
   const std::size_t actual_batch = entries_.size();
   if (actual_batch == 0) return;
@@ -835,6 +932,26 @@ void Lc0exCudaBackendComputation::ComputeBlocking() {
   std::vector<float> wdl(actual_batch * kNumWdlOutputs);
   std::vector<float> mlh;
   if (program.output_mlh) mlh.resize(actual_batch);
+  // Child-Q rows come back only when a request in this batch asks for them.
+  // The NN cache asks for every entry with legal moves once the backend has
+  // the head, so in search that is every batch.
+  bool want_childq = false;
+  if (program.output_childq_mean) {
+    for (std::size_t sample = 0; sample < actual_batch; ++sample) {
+      if (!entries_[sample].result.cq.empty()) {
+        want_childq = true;
+        break;
+      }
+    }
+  }
+  const std::size_t childq_element =
+      program.childq_f16 ? sizeof(std::uint16_t) : sizeof(float);
+  std::vector<std::byte> childq_means;
+  std::vector<std::byte> childq_variances;
+  if (want_childq) {
+    childq_means.resize(actual_batch * kNumOutputPolicy * childq_element);
+    childq_variances.resize(actual_batch * kNumOutputPolicy * childq_element);
+  }
 
   const auto policy_bytes = std::as_writable_bytes(std::span<float>(policy));
   const auto wdl_bytes = std::as_writable_bytes(std::span<float>(wdl));
@@ -875,6 +992,17 @@ void Lc0exCudaBackendComputation::ComputeBlocking() {
             .CopyToHostAsync(mlh_bytes.subspan(offset * sizeof(float)),
                              count * sizeof(float));
       }
+      if (want_childq) {
+        const std::size_t row_bytes = kNumOutputPolicy * childq_element;
+        const auto mean_bytes = std::span<std::byte>(childq_means);
+        const auto variance_bytes = std::span<std::byte>(childq_variances);
+        execution.GetBuffer(*spec.output_childq_mean)
+            .CopyToHostAsync(mean_bytes.subspan(offset * row_bytes),
+                             count * row_bytes);
+        execution.GetBuffer(*spec.output_childq_var)
+            .CopyToHostAsync(variance_bytes.subspan(offset * row_bytes),
+                             count * row_bytes);
+      }
       execution.Synchronize();
     };
 
@@ -900,6 +1028,15 @@ void Lc0exCudaBackendComputation::ComputeBlocking() {
     }
     if (entry.result.m) {
       *entry.result.m = mlh.empty() ? 0.0f : mlh[sample];
+    }
+    if (want_childq && !entry.result.cq.empty()) {
+      const std::size_t row_bytes = kNumOutputPolicy * childq_element;
+      FillChildQ(entry,
+                 std::span<const std::byte>(
+                     childq_means.data() + sample * row_bytes, row_bytes),
+                 std::span<const std::byte>(
+                     childq_variances.data() + sample * row_bytes, row_bytes),
+                 program.childq_f16);
     }
   }
 }
