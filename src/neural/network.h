@@ -67,6 +67,15 @@ class NetworkComputation {
   // Returns P value @move_id of @sample.
   virtual float GetPVal(int sample, int move_id) const = 0;
   virtual float GetMVal(int sample) const = 0;
+  // Returns the child-Q head's expected child value (side-to-move frame of
+  // @sample) and its standard deviation for move @move_id, indexed like
+  // GetPVal(). Networks without the head return 0 and -1.
+  virtual float GetChildQVal(int /* sample */, int /* move_id */) const {
+    return 0.0f;
+  }
+  virtual float GetChildSigmaVal(int /* sample */, int /* move_id */) const {
+    return -1.0f;
+  }
   virtual ~NetworkComputation() = default;
 };
 
@@ -86,6 +95,8 @@ struct NetworkCapabilities {
   pblczero::NetworkFormat::InputFormat input_format;
   pblczero::NetworkFormat::OutputFormat output_format;
   pblczero::NetworkFormat::MovesLeftFormat moves_left;
+  // Whether GetChildQVal() and GetChildSigmaVal() come from a child-Q head.
+  bool has_childq = false;
   // TODO expose information of whether GetDVal() is usable or always zero.
 
   // Combines capabilities by setting the most restrictive ones. May throw
@@ -102,6 +113,7 @@ struct NetworkCapabilities {
                       std::to_string(other.output_format));
     }
     if (!other.has_mlh()) moves_left = pblczero::NetworkFormat::MOVES_LEFT_NONE;
+    if (!other.has_childq) has_childq = false;
   }
 
   bool has_mlh() const {

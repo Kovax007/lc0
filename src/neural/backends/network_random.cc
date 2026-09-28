@@ -94,6 +94,23 @@ class RandomNetworkComputation : public NetworkComputation {
            (a / 10000.0f);
   }
 
+  // Synthetic child-Q head (backend option childq=true), for exercising the
+  // consumers on CPU: a deterministic value in [-1, 1] and a sigma in
+  // [0.05, 0.30] per (position, move). Not a model of anything.
+  float GetChildQVal(int sample, int move_id) const override {
+    return (int(HashCat({inputs_[sample], static_cast<unsigned long>(move_id),
+                         777}) %
+                20001) -
+            10000) /
+           10000.0f;
+  }
+  float GetChildSigmaVal(int sample, int move_id) const override {
+    return 0.05f + (HashCat({inputs_[sample],
+                              static_cast<unsigned long>(move_id), 778}) %
+                    1001) /
+                       4000.0f;
+  }
+
  private:
   std::vector<std::uint64_t> inputs_;
   int delay_ms_ = 0;
@@ -117,7 +134,8 @@ class RandomNetwork : public Network {
                     "input_mode",
                     pblczero::NetworkFormat::INPUT_CLASSICAL_112_PLANE)),
             pblczero::NetworkFormat::OUTPUT_WDL,
-            pblczero::NetworkFormat::MOVES_LEFT_NONE} {}
+            pblczero::NetworkFormat::MOVES_LEFT_NONE,
+            options.GetOrDefault<bool>("childq", false)} {}
   std::unique_ptr<NetworkComputation> NewComputation() override {
     return std::make_unique<RandomNetworkComputation>(delay_ms_, seed_,
                                                       uniform_mode_);

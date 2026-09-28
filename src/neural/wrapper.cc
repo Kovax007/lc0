@@ -62,6 +62,7 @@ class NetworkAsBackend : public Backend {
     attrs_.suggested_num_search_threads = network_->GetThreads();
     attrs_.recommended_batch_size = network_->GetMiniBatchSize();
     attrs_.maximum_batch_size = network_->GetMaximumBatchSize();
+    attrs_.has_childq = caps.has_childq;
     input_format_ = caps.input_format;
   }
 
@@ -129,6 +130,19 @@ class NetworkAsBackendComputation : public BackendComputation {
       if (result.d) *result.d = computation_->GetDVal(i);
       if (result.m) *result.m = computation_->GetMVal(i);
       if (!result.p.empty()) SoftmaxPolicy(result.p, computation_.get(), i);
+      if (!result.cq.empty()) FillChildQ(result, computation_.get(), i);
+    }
+  }
+
+  void FillChildQ(const EvalResultPtr& result,
+                  const NetworkComputation* computation, int idx) {
+    const std::vector<Move>& moves = entries_[idx].legal_moves;
+    const int transform = entries_[idx].transform;
+    // Raw head outputs: no softmax, temperature or renormalisation.
+    for (size_t i = 0; i < moves.size(); ++i) {
+      const int nn_index = MoveToNNIndex(moves[i], transform);
+      result.cq[i] = computation->GetChildQVal(idx, nn_index);
+      result.cs[i] = computation->GetChildSigmaVal(idx, nn_index);
     }
   }
 

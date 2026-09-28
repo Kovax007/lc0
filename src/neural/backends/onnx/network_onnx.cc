@@ -125,6 +125,8 @@ class OnnxComputation final : public NetworkComputation {
   float GetDVal(int sample) const override;
   float GetPVal(int sample, int move_id) const override;
   float GetMVal(int sample) const override;
+  float GetChildQVal(int sample, int move_id) const override;
+  float GetChildSigmaVal(int sample, int move_id) const override;
 
  private:
   Ort::IoBinding PrepareInputs(int start, int batch_size, int step);
@@ -200,6 +202,8 @@ class OnnxNetwork final : public Network {
   int wdl_head_ = -1;
   int value_head_ = -1;
   int mlh_head_ = -1;
+  int childq_mean_head_ = -1;
+  int childq_var_head_ = -1;
   NetworkCapabilities capabilities_;
   bool fp16_;
   bool bf16_;
@@ -232,9 +236,13 @@ InputsOutputs::InputsOutputs(OnnxNetwork* network)
   int wdl_head = network->wdl_head_;
   int policy_head = network->policy_head_;
   int mlh_head = network->mlh_head_;
+  int childq_mean_head = network->childq_mean_head_;
+  int childq_var_head = network->childq_var_head_;
   int data_size = (network->fp16_ | network->bf16_) ? 2 : 4;
   int outputs_size =
-      std::max({value_head, wdl_head, policy_head, mlh_head}) + 1;
+      std::max({value_head, wdl_head, policy_head, mlh_head, childq_mean_head,
+                childq_var_head}) +
+      1;
   output_tensors_data_.resize(outputs_size);
   output_tensors_data_device_.resize(outputs_size);
   output_tensors_step_.resize(outputs_size);
@@ -250,6 +258,10 @@ InputsOutputs::InputsOutputs(OnnxNetwork* network)
   }
   if (mlh_head != -1) {
     output_tensors_step_[mlh_head] = 1;
+  }
+  if (childq_mean_head != -1) {
+    output_tensors_step_[childq_mean_head] = kNumOutputPolicy;
+    output_tensors_step_[childq_var_head] = kNumOutputPolicy;
   }
 
   switch (provider_) {
@@ -419,6 +431,24 @@ float OnnxComputation<DataType>::GetMVal(int sample) const {
   DataType* data = static_cast<DataType*>(
       inputs_outputs_->output_tensors_data_[network_->mlh_head_]);
   return AsFloat(data[sample]);
+}
+
+template <typename DataType>
+float OnnxComputation<DataType>::GetChildQVal(int sample, int move_id) const {
+  if (network_->childq_mean_head_ == -1) return 0.0f;
+  DataType* data = static_cast<DataType*>(
+      inputs_outputs_->output_tensors_data_[network_->childq_mean_head_]);
+  return AsFloat(data[sample * kNumOutputPolicy + move_id]);
+}
+
+template <typename DataType>
+float OnnxComputation<DataType>::GetChildSigmaVal(int sample,
+                                                  int move_id) const {
+  if (network_->childq_var_head_ == -1) return -1.0f;
+  DataType* data = static_cast<DataType*>(
+      inputs_outputs_->output_tensors_data_[network_->childq_var_head_]);
+  return std::sqrt(
+      std::max(AsFloat(data[sample * kNumOutputPolicy + move_id]), 0.0f));
 }
 
 template <typename DataType>
@@ -920,6 +950,45 @@ OnnxNetwork::OnnxNetwork(const WeightsFile& file, const OptionsDict& opts,
     session_.emplace_back(onnx_env_, file.onnx_model().model().data(),
                           file.onnx_model().model().size(),
                           GetOptions(threads, batch_size_ * step, hash, optimize));
+
+  // The child-Q head is found by its graph output names only (no net.proto
+  // field): both "/output/childq_mean" and "/output/childq_var" with the data
+  // type of the policy output, as export512.py writes them. Same detection as
+  // the 09-11 lc0-cv3-childq port.
+  const Ort::Session& session = session_[0];
+  Ort::AllocatorWithDefaultOptions allocator;
+  auto element_type = [&](const std::string& name) {
+    for (size_t i = 0; i < session.GetOutputCount(); i++) {
+      if (name == session.GetOutputNameAllocated(i, allocator).get()) {
+        return session.GetOutputTypeInfo(i)
+            .GetTensorTypeAndShapeInfo()
+            .GetElementType();
+      }
+    }
+    return ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+  };
+  const std::string mean_name = "/output/childq_mean";
+  const std::string var_name = "/output/childq_var";
+  const auto policy_type = element_type(outputs_[policy_head_]);
+  const auto mean_type = element_type(mean_name);
+  const auto var_type = element_type(var_name);
+  if (mean_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED &&
+      var_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED) {
+    if (mean_type == policy_type && var_type == policy_type) {
+      childq_mean_head_ = outputs_.size();
+      outputs_.emplace_back(mean_name);
+      childq_var_head_ = outputs_.size();
+      outputs_.emplace_back(var_name);
+    } else {
+      CERR << "WARNING: The child-Q outputs have a different data type than "
+              "the policy output and are not used.";
+    }
+  }
+  capabilities_.has_childq = childq_mean_head_ != -1;
+  if (capabilities_.has_childq) {
+    CERR << "Child-Q head: " << outputs_[childq_mean_head_] << ", "
+         << outputs_[childq_var_head_] << ".";
+  }
 }
 
 template <OnnxProvider kProvider>

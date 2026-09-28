@@ -55,6 +55,8 @@ struct CachedValue {
   float m;
   uint8_t num_moves;
   std::unique_ptr<float[]> p;
+  // Child-Q means followed by sigmas (2 * num_moves), when the backend has them.
+  std::unique_ptr<float[]> childq;
 };
 
 void CachedValueToEvalResult(const CachedValue& cv, const EvalResultPtr& ptr) {
@@ -62,6 +64,12 @@ void CachedValueToEvalResult(const CachedValue& cv, const EvalResultPtr& ptr) {
   if (ptr.q) *ptr.q = cv.q;
   if (ptr.m) *ptr.m = cv.m;
   std::copy(cv.p.get(), cv.p.get() + ptr.p.size(), ptr.p.begin());
+  if (!ptr.cq.empty()) {
+    const float* childq = cv.childq.get();
+    std::copy(childq, childq + ptr.cq.size(), ptr.cq.begin());
+    std::copy(childq + cv.num_moves, childq + cv.num_moves + ptr.cs.size(),
+              ptr.cs.begin());
+  }
 }
 
 class MemCache : public CachingBackend {
@@ -71,7 +79,8 @@ class MemCache : public CachingBackend {
         cache_(options.Get<int>(SharedBackendParams::kNNCacheSizeId)),
         // At least 1: a zero capacity would flush forever.
         max_batch_size_(std::max(
-            1, wrapped_backend_->GetAttributes().maximum_batch_size)) {}
+            1, wrapped_backend_->GetAttributes().maximum_batch_size)),
+        has_childq_(wrapped_backend_->GetAttributes().has_childq) {}
 
   BackendAttributes GetAttributes() const override {
     return wrapped_backend_->GetAttributes();
@@ -103,6 +112,10 @@ class MemCache : public CachingBackend {
   std::unique_ptr<Backend> wrapped_backend_;
   HashKeyedCache<CachedValue> cache_;
   const size_t max_batch_size_;
+  // Cached entries with legal moves keep the child-Q head whenever the backend
+  // has one, also for requests that do not ask for it (prefetch), so that a
+  // later request that does is still a cache hit.
+  const bool has_childq_;
   friend class MemCacheComputation;
 };
 
@@ -154,7 +167,8 @@ class MemCacheComputation : public BackendComputation {
       // against hash collisions.
       if (lock.holds_value() &&
           (pos.legal_moves.empty() ||
-           (lock->p && lock->num_moves == pos.legal_moves.size()))) {
+           (lock->p && lock->num_moves == pos.legal_moves.size() &&
+            (result.cq.empty() || lock->childq)))) {
         CachedValueToEvalResult(**lock, result);
         return AddInputResult::FETCHED_IMMEDIATELY;
       }
@@ -190,11 +204,17 @@ class MemCacheComputation : public BackendComputation {
     value->p.reset(pos.legal_moves.empty() ? nullptr
                                            : new float[pos.legal_moves.size()]);
     value->num_moves = pos.legal_moves.size();
-    return wrapped_computation_->AddInput(
-        pos, EvalResultPtr{&value->q, &value->d, &value->m,
-                           value->p ? std::span<float>{value->p.get(),
-                                                       pos.legal_moves.size()}
-                                    : std::span<float>{}});
+    EvalResultPtr value_ptr{&value->q, &value->d, &value->m,
+                            value->p ? std::span<float>{value->p.get(),
+                                                        pos.legal_moves.size()}
+                                     : std::span<float>{}};
+    if (value->p && memcache_->has_childq_) {
+      const size_t num_moves = pos.legal_moves.size();
+      value->childq.reset(new float[2 * num_moves]);
+      value_ptr.cq = {value->childq.get(), num_moves};
+      value_ptr.cs = {value->childq.get() + num_moves, num_moves};
+    }
+    return wrapped_computation_->AddInput(pos, value_ptr);
   }
 
   // Delivers an entry's value to its caller and into the cache.
@@ -265,6 +285,12 @@ std::optional<EvalResult> MemCache::GetCachedEvaluation(
     result.p.reserve(pos.legal_moves.size());
     std::copy(lock->p.get(), lock->p.get() + pos.legal_moves.size(),
               std::back_inserter(result.p));
+  }
+  if (lock->childq && !pos.legal_moves.empty()) {
+    const size_t num_moves = pos.legal_moves.size();
+    result.cq.assign(lock->childq.get(), lock->childq.get() + num_moves);
+    result.cs.assign(lock->childq.get() + num_moves,
+                     lock->childq.get() + 2 * num_moves);
   }
   return result;
 }
