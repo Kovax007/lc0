@@ -65,6 +65,13 @@ const OptionId SharedBackendParams::kNNCacheSizeId{
     "Number of positions to store in a memory cache. A large cache can speed "
     "up searching, but takes memory."};
 
+const OptionId SharedBackendParams::kNNCacheRule50KeyFromId{
+    "nncache-rule50-key-from", "NNCacheRule50KeyFrom",
+    "From this rule50 ply count on, the memory cache keys a position by its "
+    "rule50 count too (one bucket per ply), so an evaluation made at another "
+    "rule50 count is never reused where the 50-move rule is close. 0 = off "
+    "(the key is the board and the repetition count only)."};
+
 const OptionId SharedBackendParams::kBatchMergeMaxBatch{
     "batch-merge-max-batch", "BatchMergeMaxBatch",
     "Merge the batches of concurrent callers into a single backend batch of at "
@@ -96,6 +103,8 @@ void SharedBackendParams::Populate(OptionsParser* options) {
   options->Add<StringOption>(SharedBackendParams::kBackendOptionsId);
   options->Add<IntOption>(SharedBackendParams::kNNCacheSizeId, 0, 999999999) =
       2000000;
+  options->Add<IntOption>(SharedBackendParams::kNNCacheRule50KeyFromId, 0,
+                          100) = 0;
   options->Add<IntOption>(SharedBackendParams::kBatchMergeMaxBatch, 0, 4096) = 0;
   options->Add<IntOption>(SharedBackendParams::kBatchMergeWaitUs, 0, 1000000) =
       200;

@@ -303,8 +303,14 @@ void V6TrainingDataArray::FillV8Block(V8TrainingData* out,
       cp > 0.0f ? v8::EncodeCount(static_cast<uint64_t>(cp + 0.5f)) : 0;
 }
 
+void V6TrainingDataArray::MarkLastForcedPly() {
+  if (training_data_.empty()) return;
+  training_data_.back().provenance_flags |= v8::kProvForcedPly;
+}
+
 void V6TrainingDataArray::Write(TrainingDataWriter* writer, GameResult result,
-                                bool adjudicated) const {
+                                bool adjudicated,
+                                bool final_eval_as_result) const {
   if (training_data_.empty()) return;
   // Base estimate off of best_m.  If needed external processing can use a
   // different approach.
@@ -324,6 +330,19 @@ void V6TrainingDataArray::Write(TrainingDataWriter* writer, GameResult result,
     } else {
       chunk.result_q = 0;
       chunk.result_d = 1;
+    }
+    if (final_eval_as_result && result == GameResult::UNDECIDED) {
+      // A replayed line without a result: the last searched position's own
+      // value, seen from this record's side to move.
+      const auto& last = training_data_.back();
+      bool last_black_to_move = last.side_to_move_or_enpassant;
+      if (IsCanonicalFormat(static_cast<pblczero::NetworkFormat::InputFormat>(
+              last.input_format))) {
+        last_black_to_move = (last.invariance_info & (1u << 7)) != 0;
+      }
+      chunk.result_q =
+          (last_black_to_move != black_to_move ? -1.0f : 1.0f) * last.best_q;
+      chunk.result_d = last.best_d;
     }
     if (adjudicated) {
       chunk.invariance_info |= 1u << 5;  // Game adjudicated.
@@ -347,8 +366,9 @@ void V6TrainingDataArray::Write(TrainingDataWriter* writer, GameResult result,
   }
 }
 
-void V6TrainingDataArray::Add(
-    const classic::Node* node, const PositionHistory& history, classic::Eval best_eval,
+template <typename NodeT>
+void V6TrainingDataArray::AddImpl(
+    const NodeT* node, const PositionHistory& history, classic::Eval best_eval,
     classic::Eval played_eval, bool best_is_proven, Move best_move,
     Move played_move, const std::vector<std::tuple<float, float>>& visits,
     std::span<Move> legal_moves, const std::optional<EvalResult>& nneval,
@@ -562,5 +582,31 @@ void V6TrainingDataArray::Add(
   result.plies_left = 0;
   training_data_.push_back(result);
 }
+
+void V6TrainingDataArray::Add(
+    const classic::Node* node, const PositionHistory& history, classic::Eval best_eval,
+    classic::Eval played_eval, bool best_is_proven, Move best_move,
+    Move played_move, const std::vector<std::tuple<float, float>>& visits,
+    std::span<Move> legal_moves, const std::optional<EvalResult>& nneval,
+    const RootSearchData* root_data) {
+  AddImpl(node, history, best_eval, played_eval, best_is_proven, best_move,
+          played_move, visits, legal_moves, nneval, root_data);
+}
+
+#ifdef LC0_CHILDQ_CLASSIC
+void V6TrainingDataArray::Add(
+    const childq_classic::Node* node, const PositionHistory& history,
+    childq_classic::Eval best_eval, childq_classic::Eval played_eval,
+    bool best_is_proven, Move best_move, Move played_move,
+    const std::vector<std::tuple<float, float>>& visits,
+    std::span<Move> legal_moves, const std::optional<EvalResult>& nneval,
+    const RootSearchData* root_data) {
+  AddImpl(node, history,
+          classic::Eval{best_eval.wl, best_eval.d, best_eval.ml},
+          classic::Eval{played_eval.wl, played_eval.d, played_eval.ml},
+          best_is_proven, best_move, played_move, visits, legal_moves, nneval,
+          root_data);
+}
+#endif
 
 }  // namespace lczero

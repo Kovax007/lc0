@@ -40,8 +40,12 @@ namespace {
 
 class RandomNetworkComputation : public NetworkComputation {
  public:
-  RandomNetworkComputation(int delay, int seed, bool uniform_mode)
-      : delay_ms_(delay), seed_(seed), uniform_mode_(uniform_mode) {}
+  RandomNetworkComputation(int delay, int seed, bool uniform_mode,
+                           float draw_eps = 0.0f)
+      : delay_ms_(delay),
+        seed_(seed),
+        uniform_mode_(uniform_mode),
+        draw_eps_(draw_eps) {}
 
   void AddInput(InputPlanes&& input) override {
     std::uint64_t hash = seed_;
@@ -65,11 +69,17 @@ class RandomNetworkComputation : public NetworkComputation {
 
   float GetQVal(int sample) const override {
     if (uniform_mode_) return 0.0f;
-    return (int(inputs_[sample] % 200000) - 100000) / 100000.0;
+    const float q = (int(inputs_[sample] % 200000) - 100000) / 100000.0;
+    // Test knob draw_eps: every position is a draw whose value is the usual
+    // random q scaled to +-draw_eps. With 1e-20 this is a value head that is
+    // sure of the draw to the last bit: root moves differ by less than any
+    // meaningful amount without being equal (see kTieAdvantage in the search).
+    return draw_eps_ > 0.0f ? q * draw_eps_ : q;
   }
 
   float GetDVal(int sample) const override {
     if (uniform_mode_) return 0.0f;
+    if (draw_eps_ > 0.0f) return 1.0f - std::fabs(GetQVal(sample));
     // Maximum D value is 1 - abs(Q) for W, D, L to be in range [0.0, 1.0].
     float q = GetQVal(sample);
     float max_d = 1.0f - std::fabs(q);
@@ -116,6 +126,7 @@ class RandomNetworkComputation : public NetworkComputation {
   int delay_ms_ = 0;
   int seed_ = 0;
   bool uniform_mode_ = false;
+  float draw_eps_ = 0.0f;
 };
 
 class RandomNetwork : public Network {
@@ -124,6 +135,7 @@ class RandomNetwork : public Network {
       : delay_ms_(options.GetOrDefault<int>("delay", 0)),
         seed_(options.GetOrDefault<int>("seed", 0)),
         uniform_mode_(options.GetOrDefault<bool>("uniform", false)),
+        draw_eps_(options.GetOrDefault<float>("draw_eps", 0.0f)),
         // Test knob: a small maximum batch makes the search overrun the
         // backend's capacity on CPU, which is how the fleet's
         // "AtomicVector overflow: capacity is 64" is reproduced and gated.
@@ -138,7 +150,7 @@ class RandomNetwork : public Network {
             options.GetOrDefault<bool>("childq", false)} {}
   std::unique_ptr<NetworkComputation> NewComputation() override {
     return std::make_unique<RandomNetworkComputation>(delay_ms_, seed_,
-                                                      uniform_mode_);
+                                                      uniform_mode_, draw_eps_);
   }
   const NetworkCapabilities& GetCapabilities() const override {
     return capabilities_;
@@ -149,6 +161,7 @@ class RandomNetwork : public Network {
   int delay_ms_ = 0;
   int seed_ = 0;
   bool uniform_mode_ = false;
+  float draw_eps_ = 0.0f;
   int max_batch_ = 1024;
   NetworkCapabilities capabilities_{
       pblczero::NetworkFormat::INPUT_CLASSICAL_112_PLANE,

@@ -28,6 +28,8 @@
 #include "neural/memcache.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <iostream>
 #include <atomic>
 #include <mutex>
 #include <shared_mutex>
@@ -37,6 +39,7 @@
 #include "utils/atomic_vector.h"
 #include "utils/cache.h"
 #include "utils/logging.h"
+#include "utils/hashcat.h"
 #include "utils/smallarray.h"
 
 namespace lczero {
@@ -48,6 +51,25 @@ namespace {
 uint64_t ComputeEvalPositionHash(const EvalPosition& pos) {
   return pos.pos.back().Hash();
 }
+
+// --nncache-rule50-key-from=N (0 = off): from rule50 ply N on, the key carries
+// the exact rule50 count too, so a cached evaluation made at another rule50
+// count is not reused where the 50-move rule is close (the rule50-blind cache
+// artefact: a rule50-99 draw stored as a win). Below N the key is unchanged.
+uint64_t ComputeEvalPositionHash(const EvalPosition& pos, int rule50_key_from) {
+  const uint64_t hash = ComputeEvalPositionHash(pos);
+  if (rule50_key_from <= 0) return hash;
+  const int rule50 = pos.pos.back().GetRule50Ply();
+  return rule50 >= rule50_key_from
+             ? HashCat(hash, static_cast<uint64_t>(rule50))
+             : hash;
+}
+
+// Test hook (LC0_MEMCACHE_STATS set): lookups and hits of the cache, printed
+// to stderr when the cache is destroyed.
+const bool kMemCacheStats = std::getenv("LC0_MEMCACHE_STATS") != nullptr;
+std::atomic<uint64_t> g_memcache_lookups{0};
+std::atomic<uint64_t> g_memcache_hits{0};
 
 struct CachedValue {
   float q;
@@ -80,7 +102,19 @@ class MemCache : public CachingBackend {
         // At least 1: a zero capacity would flush forever.
         max_batch_size_(std::max(
             1, wrapped_backend_->GetAttributes().maximum_batch_size)),
-        has_childq_(wrapped_backend_->GetAttributes().has_childq) {}
+        has_childq_(wrapped_backend_->GetAttributes().has_childq),
+        rule50_key_from_(
+            options.Get<int>(SharedBackendParams::kNNCacheRule50KeyFromId)) {}
+
+  ~MemCache() override {
+    if (kMemCacheStats) {
+      const uint64_t n = g_memcache_lookups.load();
+      const uint64_t h = g_memcache_hits.load();
+      std::cerr << "memcache stats: lookups " << n << " hits " << h
+                << " hit rate " << (n ? static_cast<double>(h) / n : 0.0)
+                << " rule50_key_from " << rule50_key_from_ << std::endl;
+    }
+  }
 
   BackendAttributes GetAttributes() const override {
     return wrapped_backend_->GetAttributes();
@@ -96,6 +130,13 @@ class MemCache : public CachingBackend {
     if (ret == Backend::UPDATE_OK) {
       // Check if we need to clear the cache.
       if (!wrapped_backend_->IsSameConfiguration(options)) {
+        cache_.Clear();
+      }
+      // A changed rule50 key makes every stored key the wrong kind: start over.
+      const int rule50_key_from =
+          options.Get<int>(SharedBackendParams::kNNCacheRule50KeyFromId);
+      if (rule50_key_from != rule50_key_from_) {
+        rule50_key_from_ = rule50_key_from;
         cache_.Clear();
       }
     }
@@ -116,6 +157,8 @@ class MemCache : public CachingBackend {
   // has one, also for requests that do not ask for it (prefetch), so that a
   // later request that does is still a cache hit.
   const bool has_childq_;
+  // --nncache-rule50-key-from; set at construction and between searches only.
+  int rule50_key_from_ = 0;
   friend class MemCacheComputation;
 };
 
@@ -158,7 +201,9 @@ class MemCacheComputation : public BackendComputation {
   virtual AddInputResult AddInput(const EvalPosition& pos,
                                   EvalResultPtr result) override {
     assert(pos.legal_moves.size() == result.p.size() || result.p.empty());
-    const uint64_t hash = ComputeEvalPositionHash(pos);
+    const uint64_t hash =
+        ComputeEvalPositionHash(pos, memcache_->rule50_key_from_);
+    if (kMemCacheStats) g_memcache_lookups.fetch_add(1);
     {
       HashKeyedCacheLock<CachedValue> lock(&memcache_->cache_, hash);
       // Sometimes search queries NN without passing the legal moves. It is
@@ -170,6 +215,7 @@ class MemCacheComputation : public BackendComputation {
            (lock->p && lock->num_moves == pos.legal_moves.size() &&
             (result.cq.empty() || lock->childq)))) {
         CachedValueToEvalResult(**lock, result);
+        if (kMemCacheStats) g_memcache_hits.fetch_add(1);
         return AddInputResult::FETCHED_IMMEDIATELY;
       }
     }
@@ -270,7 +316,7 @@ std::unique_ptr<BackendComputation> MemCache::CreateComputation() {
 }
 std::optional<EvalResult> MemCache::GetCachedEvaluation(
     const EvalPosition& pos) {
-  const uint64_t hash = ComputeEvalPositionHash(pos);
+  const uint64_t hash = ComputeEvalPositionHash(pos, rule50_key_from_);
   HashKeyedCacheLock<CachedValue> lock(&cache_, hash);
   if (!lock.holds_value() ||
       (!pos.legal_moves.empty() &&

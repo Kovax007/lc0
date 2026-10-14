@@ -37,6 +37,7 @@
 
 #include "chess/bitboard.h"
 #include "chess/board.h"
+#include "chess/position.h"
 #include "utils/exception.h"
 #include "utils/logging.h"
 
@@ -45,6 +46,12 @@ namespace lczero {
 struct Opening {
   std::string start_fen = ChessBoard::kStartposFen;
   MoveList moves;
+  // Only the replay reader fills these; the opening-book reader leaves them
+  // at their defaults.
+  GameResult result = GameResult::UNDECIDED;
+  // Replay: the first `lead_in` moves are played without a search and without
+  // a record, so that the first searched position has a real history.
+  int lead_in = 0;
 };
 
 inline bool GzGetLine(gzFile file, std::string& line) {
@@ -140,6 +147,9 @@ class PgnReader {
           }
           if (all_nums) {
             word = word.substr(idx + 1);
+            // "12..." (the number of a Black move): drop the other dots too.
+            const auto rest = word.find_first_not_of('.');
+            word = rest == std::string::npos ? "" : word.substr(rest);
           }
         }
         // Pure move numbers can be skipped.
@@ -150,9 +160,10 @@ class PgnReader {
         cur_game_.push_back(SanToMove(word, cur_board_));
         cur_board_.ApplyMove(cur_game_.back());
         // Board ApplyMove wants mirrored for black, but outside code wants
-        // normal, so mirror it back again.
-        // Check equal to 0 since we've already added the position.
-        if ((cur_game_.size() % 2) == 0) cur_game_.back().Flip();
+        // normal, so mirror it back again. The board is still the mover's
+        // here: flipped means Black made the move (the opening may start with
+        // Black to move, so the parity of the move count does not tell).
+        if (cur_board_.flipped()) cur_game_.back().Flip();
         cur_board_.Mirror();
       }
     }
@@ -164,7 +175,7 @@ class PgnReader {
   std::vector<Opening> GetGames() const { return games_; }
   std::vector<Opening>&& ReleaseGames() { return std::move(games_); }
 
- private:
+ protected:
   void Flush() {
     games_.push_back({cur_startpos_, cur_game_});
     cur_game_.clear();
@@ -290,8 +301,9 @@ class PgnReader {
           enpassant = Square(sq.file(), kRank6);
         }
         Square to(File::FromIdx(c2), Rank::FromIdx(sr2));
+        // Only a pawn takes en passant; a piece may move onto that square.
         Move move_to_find = promotion ? Move::WhitePromotion(sq, to, *promotion)
-                            : enpassant && *enpassant == to
+                            : p == 0 && enpassant && *enpassant == to
                                 ? Move::WhiteEnPassant(sq, to)
                                 : Move::White(sq, to);
         if (std::find(plm.begin(), plm.end(), move_to_find) == plm.end()) {
@@ -324,8 +336,9 @@ class PgnReader {
     Square from(File::FromIdx(c1), Rank::FromIdx(r1));
     Square to(File::FromIdx(c2), Rank::FromIdx(r2));
     Move m = promotion ? Move::WhitePromotion(from, to, *promotion)
-             : enpassant && *enpassant == to ? Move::WhiteEnPassant(from, to)
-                                             : Move::White(from, to);
+             : p == 0 && enpassant && *enpassant == to
+                 ? Move::WhiteEnPassant(from, to)
+                 : Move::White(from, to);
     if (board.flipped()) m.Flip();
     return m;
   }
@@ -334,6 +347,251 @@ class PgnReader {
   MoveList cur_game_;
   std::string cur_startpos_ = ChessBoard::kStartposFen;
   std::vector<Opening> games_;
+};
+
+// The reader behind selfplay --replay-pgn (lc0 PR 1682 "action replay" and
+// PR 1786 "improvements for the pgn file reader", borg323). Against the
+// opening-book reader above: the first move may be Black's, the game result is
+// kept, a game ends at its result token, annotations and NAGs are skipped,
+// "0-0" castles, variations are skipped (variation_ply < 0) or read as lines of
+// their own, and errors name the line. The tag [LeadInPlies "k"] marks the
+// first k plies of a game as its lead-in (Opening::lead_in). It is a separate
+// class so that the book reader, which every opening book goes through, parses
+// exactly as before.
+class ReplayPgnReader : public PgnReader {
+ public:
+  // variation_ply >= 0: every variation becomes a game of its own that starts
+  // that many plies before the branch point.
+  void AddPgnFile(const std::string& filepath, int variation_ply = -1) {
+    const gzFile file = gzopen(filepath.c_str(), "r");
+    if (!file) {
+      throw Exception(errno == ENOENT ? "Replay pgn file not found."
+                                      : "Error opening replay pgn file.");
+    }
+
+    std::string line;
+    bool in_comment = false;
+    bool started = false;
+    while (GzGetLine(file, line)) {
+      line_no_++;
+      if (line.substr(0, 3) == "\xEF\xBB\xBF") line = line.substr(3);
+      if (!line.empty() && line.back() == '\r') line.pop_back();
+      if (!line.empty() && line[0] == '[' && !in_comment) {
+        if (started) {
+          FlushGame("*");
+          started = false;
+        }
+        auto uc_line = line;
+        std::transform(uc_line.begin(), uc_line.end(), uc_line.begin(),
+                       [](unsigned char c) { return std::toupper(c); });
+        if (uc_line.find("[FEN \"", 0) == 0) {
+          auto start_trimmed = line.substr(6);
+          cur_startpos_ = start_trimmed.substr(0, start_trimmed.find('"'));
+          cur_board_.SetFromFen(cur_startpos_);
+        } else if (uc_line.find("[LEADINPLIES \"", 0) == 0) {
+          const auto value = line.substr(14, line.find('"', 14) - 14);
+          if (value.empty() ||
+              value.find_first_not_of("0123456789") != std::string::npos ||
+              value.size() > 4) {
+            throw Exception("Bad LeadInPlies tag on line " +
+                            std::to_string(line_no_) + " of the replay pgn.");
+          }
+          cur_lead_in_ = std::stoi(value);
+        }
+        continue;
+      }
+      // Handle braced comments.
+      int cur_offset = 0;
+      while ((in_comment && line.find('}', cur_offset) != std::string::npos) ||
+             (!in_comment && line.find('{', cur_offset) != std::string::npos)) {
+        if (in_comment && line.find('}', cur_offset) != std::string::npos) {
+          line = line.substr(0, cur_offset) +
+                 line.substr(line.find('}', cur_offset) + 1);
+          in_comment = false;
+        } else {
+          cur_offset = line.find('{', cur_offset);
+          in_comment = true;
+        }
+      }
+      if (in_comment) {
+        line = line.substr(0, cur_offset);
+      }
+      // Trim trailing comment.
+      if (line.find(';') != std::string::npos) {
+        line = line.substr(0, line.find(';'));
+      }
+      if (line.empty()) continue;
+      std::istringstream iss(line);
+      std::string word;
+      std::string tmp_word;
+      while (!iss.eof() || !tmp_word.empty()) {
+        word.clear();
+        if (tmp_word.empty()) {
+          iss >> word;
+        } else {
+          word.swap(tmp_word);
+        }
+        if (word.empty()) continue;
+        if (word[0] == '(') {
+          if (cur_game_.empty()) {
+            throw Exception("Variation with no move on line " +
+                            std::to_string(line_no_) + " of the replay pgn.");
+          }
+          variation_stack_.push_back(cur_game_);
+          cur_game_.pop_back();
+          ReplayCurGame();
+          tmp_word = word.substr(1);
+          continue;
+        } else if (word[0] == ')') {
+          if (variation_stack_.empty()) {
+            throw Exception("Too many closing parentheses on line " +
+                            std::to_string(line_no_) + " of the replay pgn.");
+          }
+          if (variation_ply >= 0) {
+            const int len = static_cast<int>(variation_stack_.back().size()) -
+                            1 - variation_ply;
+            if (len > 0) {
+              int rule50;
+              int moves;
+              ChessBoard board;
+              board.SetFromFen(cur_startpos_, &rule50, &moves);
+              const int game_ply = 2 * moves - (board.flipped() ? 1 : 2);
+              Position pos(board, rule50, game_ply);
+              for (int i = 0; i < len; i++) {
+                Move move = cur_game_[i];
+                if (pos.IsBlackToMove()) move.Flip();
+                pos = Position(pos, move);
+              }
+              games_.push_back(
+                  {PositionToFen(pos),
+                   MoveList(cur_game_.begin() + len, cur_game_.end()),
+                   GameResult::UNDECIDED});
+            } else {
+              games_.push_back(
+                  {cur_startpos_, cur_game_, GameResult::UNDECIDED});
+            }
+          }
+          cur_game_ = variation_stack_.back();
+          variation_stack_.pop_back();
+          ReplayCurGame();
+          tmp_word = word.substr(1);
+          continue;
+        }
+        auto idx = word.find_first_of("()");
+        if (idx != std::string::npos) {
+          tmp_word = word.substr(idx);
+          word.resize(idx);
+        }
+        // Trim move numbers from front ("12." and "12...").
+        idx = word.find('.');
+        if (idx != std::string::npos) {
+          bool all_nums = true;
+          for (size_t i = 0; i < idx; i++) {
+            if (word[i] < '0' || word[i] > '9') {
+              all_nums = false;
+              break;
+            }
+          }
+          if (all_nums) {
+            word = word.substr(idx + 1);
+            idx = word.find_first_not_of(".");
+            if (idx == std::string::npos) continue;
+            word = word.substr(idx);
+          }
+        }
+        // Pure move numbers can be skipped (also empty).
+        if (word.find_first_not_of("0123456789") == std::string::npos) continue;
+        // Also skip spurious annotations.
+        if (word.find_first_not_of("!?") == std::string::npos) continue;
+        // Ignore "Numeric Annotation Glyph".
+        if (word[0] == '$') continue;
+        // Inside a variation that is not read.
+        if (variation_ply < 0 && !variation_stack_.empty()) continue;
+        // The result ends the game.
+        if (word == "1/2-1/2" || word == "1-0" || word == "0-1" ||
+            word == "*") {
+          FlushGame(word);
+          started = false;
+          continue;
+        }
+        // "0-0" and "0-0-0" castle too.
+        if (word.compare(0, 3, "0-0") == 0) {
+          for (size_t i = 0; i < word.size() && i < 5; i++) {
+            if (word[i] == '0') word[i] = 'O';
+          }
+        }
+        Move move;
+        try {
+          move = SanToMove(word, cur_board_);
+        } catch (const Exception& e) {
+          throw Exception(std::string(e.what()) + " (move '" + word +
+                          "', line " + std::to_string(line_no_) +
+                          " of the replay pgn)");
+        }
+        const auto legal = cur_board_.GenerateLegalMoves();
+        if (std::find(legal.begin(), legal.end(), move) == legal.end()) {
+          throw Exception("Illegal move '" + word + "' on line " +
+                          std::to_string(line_no_) + " of the replay pgn.");
+        }
+        cur_game_.push_back(move);
+        cur_board_.ApplyMove(cur_game_.back());
+        // The board wants the move in the mover's frame, the game list wants
+        // it in the real one: flip it back when Black made it. (The book
+        // reader assumes White moves first.)
+        if (cur_board_.flipped()) cur_game_.back().Flip();
+        cur_board_.Mirror();
+        started = true;
+      }
+    }
+    if (in_comment) {
+      throw Exception("Comment reached the end of the replay pgn.");
+    }
+    if (started) {
+      FlushGame("*");
+    }
+    gzclose(file);
+  }
+
+ private:
+  void FlushGame(const std::string& termination) {
+    if (!variation_stack_.empty()) {
+      throw Exception("Variation not terminated on line " +
+                      std::to_string(line_no_) + " of the replay pgn.");
+    }
+    auto result = GameResult::UNDECIDED;
+    if (termination == "1/2-1/2") {
+      result = GameResult::DRAW;
+    } else if (termination == "1-0") {
+      result = GameResult::WHITE_WON;
+    } else if (termination == "0-1") {
+      result = GameResult::BLACK_WON;
+    }
+    if (cur_lead_in_ > 0 &&
+        cur_lead_in_ >= static_cast<int>(cur_game_.size())) {
+      throw Exception("LeadInPlies leaves no move to replay in the game that "
+                      "ends on line " +
+                      std::to_string(line_no_) + " of the replay pgn.");
+    }
+    games_.push_back({cur_startpos_, cur_game_, result, cur_lead_in_});
+    cur_game_.clear();
+    cur_board_.SetFromFen(ChessBoard::kStartposFen);
+    cur_startpos_ = ChessBoard::kStartposFen;
+    cur_lead_in_ = 0;
+  }
+
+  // Sets the board to the position after cur_game_.
+  void ReplayCurGame() {
+    cur_board_.SetFromFen(cur_startpos_);
+    for (auto move : cur_game_) {
+      if (cur_board_.flipped()) move.Flip();
+      cur_board_.ApplyMove(move);
+      cur_board_.Mirror();
+    }
+  }
+
+  int line_no_ = 0;
+  int cur_lead_in_ = 0;
+  std::vector<MoveList> variation_stack_;
 };
 
 }  // namespace lczero

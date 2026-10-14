@@ -270,6 +270,11 @@ option('dag_classic',
        value: true,
        description: 'Enable dag-classic search algorithm')
 
+option('childq_classic',
+       type: 'boolean',
+       value: true,
+       description: 'Enable the childq-classic search (classic + child-Q consumers)')
+
 option('nvcc',
        type: 'boolean',
        value: true,

@@ -96,6 +96,11 @@ void PopulateCommonStopperOptions(RunType for_what, OptionsParser* options) {
 }
 
 // Parameters needed for selfplay and uci, but not benchmark nor infinite mode.
+bool HasIntrinsicStoppers(const OptionsDict& options) {
+  return options.Get<float>(kMinimumKLDGainPerNodeId) > 0.0f ||
+         options.Get<float>(kSmartPruningFactorId) > 0.0f;
+}
+
 void PopulateIntrinsicStoppers(ChainedSearchStopper* stopper,
                                const OptionsDict& options) {
   // KLD gain.

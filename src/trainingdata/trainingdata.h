@@ -29,6 +29,9 @@
 
 #include "neural/backend.h"
 #include "search/classic/node.h"
+#ifdef LC0_CHILDQ_CLASSIC
+#include "search/childq_classic/node.h"
+#endif
 #include "trainingdata/trainingdata_v6.h"
 #include "trainingdata/childdata.h"
 #include "trainingdata/trainingdata_v7.h"
@@ -71,12 +74,44 @@ class V6TrainingDataArray {
            std::span<Move> legal_moves,
            const std::optional<EvalResult>& nneval,
            const RootSearchData* root_data = nullptr);
+#ifdef LC0_CHILDQ_CLASSIC
+  // The same record from the childq-classic search (selfplay
+  // --selfplay-search=childq-classic). Its tree is a verbatim copy of
+  // classic's, so both overloads share one body (AddImpl).
+  void Add(const childq_classic::Node* node, const PositionHistory& history,
+           childq_classic::Eval best_eval, childq_classic::Eval played_eval,
+           bool best_is_proven, Move best_move, Move played_move,
+           const std::vector<std::tuple<float, float>>& visits,
+           std::span<Move> legal_moves,
+           const std::optional<EvalResult>& nneval,
+           const RootSearchData* root_data = nullptr);
+#endif
 
-  // Writes training data to a file.
-  void Write(TrainingDataWriter* writer, GameResult result,
-             bool adjudicated) const;
+  // Sets the forced-ply provenance bit of the record added last (action
+  // replay: the move played was the line's, not the search's choice). Only the
+  // V8 record has the field.
+  void MarkLastForcedPly();
+
+  // Writes training data to a file. With `final_eval_as_result`, an UNDECIDED
+  // result is replaced by the last record's own search value (action replay
+  // of a line without a result; lc0 PR 1682); otherwise such records are
+  // written as before.
+  void Write(TrainingDataWriter* writer, GameResult result, bool adjudicated,
+             bool final_eval_as_result = false) const;
+
+  // Number of frames added so far.
+  size_t GetFrameCount() const { return training_data_.size(); }
 
  private:
+  template <typename NodeT>
+  void AddImpl(const NodeT* node, const PositionHistory& history,
+               classic::Eval best_eval, classic::Eval played_eval,
+               bool best_is_proven, Move best_move, Move played_move,
+               const std::vector<std::tuple<float, float>>& visits,
+               std::span<Move> legal_moves,
+               const std::optional<EvalResult>& nneval,
+               const RootSearchData* root_data);
+
   // Fills the V8 block (header + 128-slot table) of an already-populated V7
   // prefix. Throws on a move-frame mismatch rather than writing a record
   // whose indices nobody can trust.

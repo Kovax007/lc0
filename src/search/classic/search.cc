@@ -53,6 +53,14 @@ namespace {
 // Maximum delay between outputting "uci info" when nothing interesting happens.
 const int kUciInfoMinimumFrequencyMs = 5000;
 
+// The tie guard of the best-score correction in DeforcedVisits: see
+// kTieAdvantage in search/childq_classic/search.cc, which holds the same
+// formula and the full account.
+constexpr double kTieAdvantage = 1e-9;
+inline double EqualScoreSplitAtTie(double N, double U1, double U2) {
+  return (U1 * (N + 1.0) - U2) / (N * (U1 + U2));
+}
+
 MoveList MakeRootMoveFilter(const MoveList& searchmoves,
                             SyzygyTablebase* syzygy_tb,
                             const PositionHistory& history, bool fast_play,
@@ -962,7 +970,7 @@ std::vector<double> Search::DeforcedVisits(
   // GetVisitDistribution builds `visits`, so results index-align with it).
   struct EdgeSnapshot {
     double N, Q, M, p_clean, p_edge;
-    bool filtered, zero_policy;
+    bool filtered, zero_policy, terminal;
   };
   std::vector<EdgeSnapshot> es;
   es.reserve(root_node_->GetNumEdges());
@@ -979,6 +987,7 @@ std::vector<double> Search::DeforcedVisits(
                     : e.p_edge;
     clean_sum += e.p_clean;
     e.zero_policy = edge.IsZeroPolicy();
+    e.terminal = edge.GetN() > 0 && edge.IsTerminal();
     e.filtered = !root_move_filter_.empty() &&
                  std::find(root_move_filter_.begin(), root_move_filter_.end(),
                            edge.GetMove()) == root_move_filter_.end();
@@ -1008,6 +1017,25 @@ std::vector<double> Search::DeforcedVisits(
       best = i;
     }
   }
+  // At a root with a replay floor the anchor is the edge with the most
+  // UNFORCED visits (ties to the higher Q): the floor can make the line's move
+  // the most-visited edge without the search having chosen it, and the anchor
+  // keeps all its visits. A proven (terminal) edge is never forced (see
+  // AddForcedExploration), so its visits count in full.
+  if (replay_floor_idx_ >= 0 && forced_exploration_visits_.size() == n) {
+    best = n;
+    double max_unforced = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+      if (es[i].filtered) continue;
+      const double unforced =
+          es[i].terminal ? es[i].N : es[i].N - forced_exploration_visits_[i];
+      if (best == n || unforced > max_unforced ||
+          (unforced == max_unforced && es[i].Q > es[best].Q)) {
+        max_unforced = unforced;
+        best = i;
+      }
+    }
+  }
   if (best == n || es[best].zero_policy) return pruned;  // nothing to de-force
 
   const double best_QM = es[best].Q + es[best].M;
@@ -1024,17 +1052,24 @@ std::vector<double> Search::DeforcedVisits(
     if (N <= 0.0 || C <= 0.0) continue;
     const double U1 = P(i) * U_coeff;
     const double U2 = P(best) * U_coeff;
-    double xs = -C * N * N + N * U1 + N * U2;
-    xs *= xs;
-    const double xrr =
-        xs - 4 * C * N * N * (U2 - C * N - C - N * U1 - U1);
-    if (xrr < 0) continue;
-    const double xr = std::sqrt(xrr);
-    const double d = 2 * C * N * N;
-    const double xp = (xr + C * N * N - N * U1 - N * U2) / d;
-    const double xm = (-xr + C * N * N - N * U1 - N * U2) / d;
-    double x = (xp >= 0.0 && xp <= 1.0) ? xp : xm;
-    x = std::min(std::max(x, 1e-9), 1.0 - 1e-9);
+    double x;
+    if (C < kTieAdvantage) {
+      // A tie: the closed form below has lost its root (see kTieAdvantage).
+      x = EqualScoreSplitAtTie(N, U1, U2);
+      if (!(x > 0.0 && x < 1.0)) continue;
+    } else {
+      double xs = -C * N * N + N * U1 + N * U2;
+      xs *= xs;
+      const double xrr =
+          xs - 4 * C * N * N * (U2 - C * N - C - N * U1 - U1);
+      if (xrr < 0) continue;
+      const double xr = std::sqrt(xrr);
+      const double d = 2 * C * N * N;
+      const double xp = (xr + C * N * N - N * U1 - N * U2) / d;
+      const double xm = (-xr + C * N * N - N * U1 - N * U2) / d;
+      x = (xp >= 0.0 && xp <= 1.0) ? xp : xm;
+      x = std::min(std::max(x, 1e-9), 1.0 - 1e-9);
+    }
     const double S = (Q + M) + P(i) * U_coeff / (1.0 + N * x);
     if (S > best_S) best_S = S;
   }
@@ -1094,6 +1129,8 @@ RootSearchData Search::GetRootChildData(
   out.fe_visits = out.fe_active
                       ? static_cast<uint32_t>(params_.GetForcedExplorationVisits())
                       : 0u;
+  // A floored root records the standard budget plus the floor.
+  if (replay_floor_idx_ >= 0) out.fe_visits += replay_floor_visits_;
 
   const std::optional<EvalResult> nneval = backend_->GetCachedEvaluation(
       EvalPosition{played_history_.GetPositions(), legal_moves});
@@ -1764,6 +1801,34 @@ void Search::ResetBestMove() {
   bestmove_is_sent_ = old_sent;
 }
 
+void Search::SetReplayFloor(Move move, uint32_t visits) {
+  replay_floor_move_ = move;
+  replay_floor_visits_ = visits;
+  replay_floor_idx_ = -1;
+}
+
+void Search::ApplyReplayFloor(Node* root) {
+  if (replay_floor_visits_ == 0 || root->GetNumEdges() <= 1) return;
+  if (replay_floor_idx_ < 0) {
+    const bool black = played_history_.IsBlackToMove();
+    int i = 0;
+    for (const auto& edge : root->Edges()) {
+      if (edge.GetMove(black) == replay_floor_move_) {
+        replay_floor_idx_ = i;
+        break;
+      }
+      ++i;
+    }
+    if (replay_floor_idx_ < 0) return;  // not a move of this root
+  }
+  if (forced_exploration_visits_.empty()) {
+    // Forced exploration is off: the floor is the whole vector.
+    forced_exploration_visits_.assign(root->GetNumEdges(), 0u);
+  }
+  auto& minimum = forced_exploration_visits_[replay_floor_idx_];
+  minimum = std::max(minimum, replay_floor_visits_);
+}
+
 // Computes the best move, maybe with temperature (according to the settings).
 void Search::EnsureBestMoveKnown() REQUIRES(nodes_mutex_)
     REQUIRES(counters_mutex_) {
@@ -2363,6 +2428,9 @@ void SearchWorker::ExecuteOneIteration() {
     }
   }
 
+  // Latch the stop flag for this iteration's gather and prefetch.
+  stop_latched_ = search_->stop_.load(std::memory_order_acquire);
+
   // 2. Gather minibatch.
   GatherMinibatch();
   task_count_.store(-1, std::memory_order_release);
@@ -2620,7 +2688,7 @@ void SearchWorker::GatherMinibatch() {
           }
         }
         if ((collisions_left -= picked_node.multivisit) <= 0) return;
-        if (search_->stop_.load(std::memory_order_acquire)) return;
+        if (stop_latched_) return;
       }
     }
   }
@@ -3285,7 +3353,7 @@ void SearchWorker::MaybePrefetchIntoCache() {
   // TODO(mooskagh) Remove prefetch into cache if node collisions work well.
   // If there are requests to NN, but the batch is not full, try to prefetch
   // nodes which are likely useful in future.
-  if (search_->stop_.load(std::memory_order_acquire)) return;
+  if (stop_latched_) return;
   if (computation_->UsedBatchSize() > 0 &&
       static_cast<int>(computation_->UsedBatchSize()) <
           params_.GetMaxPrefetchBatch()) {
@@ -3347,7 +3415,7 @@ int SearchWorker::PrefetchIntoCache(Node* node, int budget, bool is_odd_depth) {
   int budget_to_spend = budget;  // Initialize for the case where there's only
                                  // one child.
   for (size_t i = 0; i < scores.size(); ++i) {
-    if (search_->stop_.load(std::memory_order_acquire)) break;
+    if (stop_latched_) break;
     if (budget <= 0) break;
 
     // Sort next chunk of a vector. 3 at a time. Most of the time it's fine.
@@ -3455,6 +3523,7 @@ void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process) {
   node->SortEdges();
   if (node == search_->root_node_) {
     search_->forced_exploration_visits_ = ComputeForcedVisits(node, params_);
+    search_->ApplyReplayFloor(node);
     if (!search_->forced_exploration_visits_.empty()) {
       search_->StoreOriginalPolicy(node, search_->noised_policy_);
     }

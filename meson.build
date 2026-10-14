@@ -259,6 +259,21 @@ if get_option('dag_classic')
 endif
 
 #############################################################################
+## CHILD-Q CLASSIC SEARCH (classic + the child-Q consumers; classic untouched)
+#############################################################################
+if get_option('childq_classic')
+  # Selfplay's --selfplay-search=childq-classic and the training-data overload
+  # for its tree are compiled only with the compartment.
+  add_project_arguments('-DLC0_CHILDQ_CLASSIC', language : 'cpp')
+  files += [
+    'src/search/childq_classic/node.cc',
+    'src/search/childq_classic/params.cc',
+    'src/search/childq_classic/search.cc',
+    'src/search/childq_classic/wrapper.cc',
+  ]
+endif
+
+#############################################################################
 ## BACKENDS
 #############################################################################
 

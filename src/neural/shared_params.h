@@ -44,6 +44,7 @@ struct SharedBackendParams {
   static const OptionId kBackendId;
   static const OptionId kBackendOptionsId;
   static const OptionId kNNCacheSizeId;
+  static const OptionId kNNCacheRule50KeyFromId;
   static const OptionId kBatchMergeMaxBatch;
   static const OptionId kBatchMergeWaitUs;
   static const OptionId kBatchMergeThreads;

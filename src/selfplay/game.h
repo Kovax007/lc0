@@ -32,6 +32,9 @@
 #include "chess/uciloop.h"
 #include "neural/backend.h"
 #include "search/classic/search.h"
+#ifdef LC0_CHILDQ_CLASSIC
+#include "search/childq_classic/search.h"
+#endif
 #include "search/classic/stoppers/stoppers.h"
 #include "trainingdata/trainingdata.h"
 #include "utils/optionsparser.h"
@@ -40,6 +43,10 @@ namespace lczero {
 
 struct SelfPlayLimits {
   std::int64_t visits = -1;
+  // Record deeper than you play: when above `visits`, the search runs to this
+  // many visits and the record is written from that state, while the move and
+  // the resign reads are those at `visits`. -1 = off.
+  std::int64_t record_visits = -1;
   std::int64_t playouts = -1;
   std::int64_t movetime = -1;
 
@@ -75,6 +82,19 @@ class SelfPlayGame {
   // Populate command line options that it uses.
   static void PopulateUciParams(OptionsParser* options);
 
+  // Action replay (--replay-pgn; lc0 PR 1682): the search runs and is recorded
+  // at every position of `line` as in any game, but the move played is the
+  // line's. The game ends when the line does, with the line's result (if that
+  // is UNDECIDED the last searched position's value becomes the result of
+  // every record). Resign, the minimum-visits re-pick and the 450-ply cap are
+  // off. `move_floor` > 0 gives the line's move a forced minimum of that share
+  // of the visit budget at every root (--replay-move-floor). Call before
+  // Play(); the game must have been built from the line's start position,
+  // with the line's lead-in moves (if any) as its opening.
+  void SetReplay(const Opening& line, float move_floor);
+  // True when a replayed line was played to its end (not aborted).
+  bool ReplayFinished() const { return replay_finished_; }
+
   // Starts the game and blocks until the game is finished.
   void Play(int white_threads, int black_threads, bool training,
             SyzygyTablebase* syzygy_tb, bool enable_resign = true);
@@ -87,6 +107,8 @@ class SelfPlayGame {
 
   // Writes training data to a file.
   void WriteTrainingData(TrainingDataWriter* writer) const;
+  // Number of training frames the game holds.
+  size_t GetTrainingFrameCount() const { return training_data_.GetFrameCount(); }
 
   GameResult GetGameResult() const { return game_result_; }
   std::vector<Move> GetMoves() const;
@@ -97,6 +119,20 @@ class SelfPlayGame {
   uint64_t nodes_total_ = 0;
 
  private:
+  // The game loop and its helpers, written once for both searches
+  // (--selfplay-search): classic's tree/search, or childq-classic's, which is
+  // classic's verbatim plus the child-Q consumers.
+  template <typename TreeT>
+  int InitTrees(std::shared_ptr<TreeT> (&tree)[2], bool shared_tree,
+                const Opening& opening, float white_prob, float black_prob);
+  template <typename TreeT, typename SearchT>
+  void PlayImpl(std::shared_ptr<TreeT> (&tree)[2],
+                std::unique_ptr<SearchT>& search, int white_threads,
+                int black_threads, bool training, SyzygyTablebase* syzygy_tb,
+                bool enable_resign);
+  template <typename TreeT>
+  static std::vector<Move> MovesOf(const TreeT& tree);
+
   // options_[0] is for white player, [1] for black.
   PlayerOptions options_[2];
   // Node tree for player1 and player2. If the tree is shared between players,
@@ -111,6 +147,13 @@ class SelfPlayGame {
   bool abort_ = false;
   GameResult game_result_ = GameResult::UNDECIDED;
   bool adjudicated_ = false;
+  // Action replay (SetReplay). The moves are in the frame GetBestMove()
+  // returns, as the pgn readers give them.
+  bool replaying_ = false;
+  MoveList replay_moves_;
+  GameResult replay_result_ = GameResult::UNDECIDED;
+  float replay_move_floor_ = 0.0f;
+  bool replay_finished_ = false;
   // Track minimum eval for each player so that GetWorstEvalForWinnerOrDraw()
   // can be calculated after end of game.
   float min_eval_[2] = {1.0f, 1.0f};
@@ -118,6 +161,13 @@ class SelfPlayGame {
   // actual outcome.
   float max_eval_[3] = {0.0f, 0.0f, 0.0f};
   const bool chess960_;
+  // --selfplay-search=childq-classic: the game runs on cq_tree_ / cq_search_
+  // and tree_ / search_ stay empty (and vice versa).
+  const bool childq_search_;
+#ifdef LC0_CHILDQ_CLASSIC
+  std::shared_ptr<childq_classic::NodeTree> cq_tree_[2];
+  std::unique_ptr<childq_classic::Search> cq_search_;
+#endif
   std::mutex mutex_;
 
   // Training data to send.

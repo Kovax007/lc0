@@ -86,6 +86,13 @@ class Search {
   // not nullptr they are set to the best move and whether it leads to a
   // terminal node respectively.
   Eval GetBestEval(Move* move = nullptr, bool* is_terminal = nullptr) const;
+
+  // Record deeper than you play (selfplay --record-visits) lives in the
+  // childq-classic search only; the game loop refuses it for this one.
+  void SetDecisionVisits(std::int64_t) {
+    throw Exception("--record-visits needs --selfplay-search=childq-classic");
+  }
+  Eval GetDecisionEval() const { return GetBestEval(); }
   // Returns the total number of playouts in the search.
   std::int64_t GetTotalPlayouts() const;
   // Returns the search parameters.
@@ -94,6 +101,12 @@ class Search {
   // If called after GetBestMove, another call to GetBestMove will have results
   // from temperature having been applied again.
   void ResetBestMove();
+
+  // Action replay (selfplay --replay-move-floor): `move`, in the frame
+  // GetBestMove() returns, gets a forced minimum of `visits` root visits
+  // through the forced-exploration vector, so the de-forcing prices it like
+  // any forced visit. Call before the search starts; 0 visits = off.
+  void SetReplayFloor(Move move, uint32_t visits);
 
   // Return processed visit distribution and original policy
   std::vector<std::tuple<float, float>> GetVisitDistribution(
@@ -214,6 +227,14 @@ class Search {
   std::atomic<int> tb_hits_{0};
   const MoveList root_move_filter_;
   std::vector<uint32_t> forced_exploration_visits_;
+  // The replay floor (SetReplayFloor): the floored move, its minimum, and its
+  // root-edge index once the root is expanded (-1 before, and at a root with
+  // one move).
+  Move replay_floor_move_;
+  uint32_t replay_floor_visits_ = 0;
+  int replay_floor_idx_ = -1;
+  // Imposes the floor on forced_exploration_visits_; a no-op without one.
+  void ApplyReplayFloor(Node* root);
   std::unique_ptr<Edge []> noised_policy_;
 
   mutable SharedMutex nodes_mutex_;
@@ -471,6 +492,10 @@ class SearchWorker {
   // History is reset and extended by PickNodeToExtend().
   PositionHistory history_;
   int number_out_of_order_ = 0;
+  // search_->stop_ as read once per iteration, before the gather. The gather
+  // and the prefetch use this copy, so a stop set mid-iteration by another
+  // thread (the watchdog) cannot change this iteration's batch.
+  bool stop_latched_ = false;
   const SearchParams& params_;
   const bool moves_left_support_;
   IterationStats iteration_stats_;

@@ -34,6 +34,10 @@
 #include "neural/memcache.h"
 #include "neural/shared_params.h"
 #include "search/classic/search.h"
+#ifdef LC0_CHILDQ_CLASSIC
+#include "search/childq_classic/params.h"
+#endif
+#include "search/classic/stoppers/common.h"
 #include "search/classic/stoppers/factory.h"
 #include "selfplay/game.h"
 #include "selfplay/multigame.h"
@@ -58,6 +62,13 @@ const OptionId kPlayoutsId{"playouts", "Playouts",
                            "Number of playouts per move to search."};
 const OptionId kVisitsId{"visits", "Visits",
                          "Number of visits per move to search."};
+const OptionId kRecordVisitsId{
+    "record-visits", "RecordVisits",
+    "Record deeper than you play: every search runs to this many visits and "
+    "the training record is written from that state, while the move played "
+    "and the resign and adjudication reads are those of the tree at --visits. "
+    "Must be at least --visits; -1 = off. Needs "
+    "--selfplay-search=childq-classic."};
 const OptionId kTimeMsId{"movetime", "MoveTime",
                          "Time per move, in milliseconds."};
 const OptionId kTrainingId{
@@ -98,6 +109,24 @@ const OptionId kSyzygyTablebaseId{
     "List of Syzygy tablebase directories, list entries separated by system "
     "separator (\";\" for Windows, \":\" for Linux).",
     's'};
+const OptionId kReplayFileId{
+    "replay-pgn", "ReplayPgnFile",
+    "A path name to a pgn file of games (lines) to replay: every position of a "
+    "line is searched and recorded as in any game, but the move played is the "
+    "line's, and the game ends with the line's result (lc0 PR 1682). Resign is "
+    "off in a replayed game. A game's tag [LeadInPlies \"k\"] makes its first "
+    "k plies a lead-in: played without a search or a record, so the first "
+    "searched position has a real history."};
+const OptionId kReplayVariationPlyId{
+    "pgn-variation-ply", "PgnVariationPly",
+    "For --replay-pgn: number of plies to keep before each pgn variation, "
+    "which then becomes a line of its own. The default -1 skips variations."};
+const OptionId kReplayMoveFloorId{
+    "replay-move-floor", "ReplayMoveFloor",
+    "For --replay-pgn: at every root the line's move gets a forced minimum of "
+    "this share of --visits, through the forced-exploration vector, so the "
+    "search sees it and the de-forcing removes it from the recorded target "
+    "again. 0 = off."};
 
 }  // namespace
 
@@ -114,13 +143,20 @@ void SelfPlayTournament::PopulateOptions(OptionsParser* options) {
 
   SharedBackendParams::Populate(options);
   options->Add<IntOption>(kThreadsId, 1, 8) = 1;
+#ifdef LC0_CHILDQ_CLASSIC
+  // classic's options, then the child-Q consumers' (--childq-*), which only
+  // --selfplay-search=childq-classic reads.
+  childq_classic::SearchParams::Populate(options);
+#else
   classic::SearchParams::Populate(options);
+#endif
 
   options->Add<BoolOption>(kShareTreesId) = true;
   options->Add<IntOption>(kTotalGamesId, -2, 999999) = -1;
   options->Add<IntOption>(kParallelGamesId, 1, 256) = 8;
   options->Add<IntOption>(kPlayoutsId, -1, 999999999) = -1;
   options->Add<IntOption>(kVisitsId, -1, 999999999) = -1;
+  options->Add<IntOption>(kRecordVisitsId, -1, 999999999) = -1;
   options->Add<IntOption>(kTimeMsId, -1, 999999999) = -1;
   options->Add<BoolOption>(kTrainingId) = false;
   options->Add<BoolOption>(kVerboseThinkingId) = false;
@@ -137,6 +173,9 @@ void SelfPlayTournament::PopulateOptions(OptionsParser* options) {
   options->Add<ChoiceOption>(kOpeningsModeId, openings_modes) = "sequential";
 
   options->Add<StringOption>(kSyzygyTablebaseId);
+  options->Add<StringOption>(kReplayFileId) = "";
+  options->Add<IntOption>(kReplayVariationPlyId, -1, 999999999) = -1;
+  options->Add<FloatOption>(kReplayMoveFloorId, 0.0f, 1.0f) = 0.0f;
   SelfPlayGame::PopulateUciParams(options);
 
   auto defaults = options->GetMutableDefaultsOptions();
@@ -179,7 +218,8 @@ SelfPlayTournament::SelfPlayTournament(const OptionsDict& options,
       kValueGamesSize(options.Get<int>(kValueModeSizeId)),
       kTournamentResultsFile(
           options.Get<std::string>(kTournamentResultsFileId)),
-      kDiscardedStartChance(options.Get<float>(kDiscardedStartChanceId)) {
+      kDiscardedStartChance(options.Get<float>(kDiscardedStartChanceId)),
+      kReplayMoveFloor(options.Get<float>(kReplayMoveFloorId)) {
   multi_games_size_ = std::max(kPolicyGamesSize, kValueGamesSize);
   std::string book = options.Get<std::string>(kOpeningsFileId);
   if (!book.empty()) {
@@ -189,6 +229,53 @@ SelfPlayTournament::SelfPlayTournament(const OptionsDict& options,
     if (options.Get<std::string>(kOpeningsModeId) == "shuffled") {
       Random::Get().Shuffle(openings_.begin(), openings_.end());
     }
+  }
+  std::string replay_pgn = options.Get<std::string>(kReplayFileId);
+  if (!replay_pgn.empty()) {
+    if (!book.empty()) {
+      throw Exception(
+          "You cannot specify an opening book when replaying games.");
+    }
+    if (multi_games_size_ > 0) {
+      throw Exception("Policy/Value games do not support replaying.");
+    }
+    if (kTotalGames != -1) {
+      throw Exception("You cannot specify a number of games when replaying.");
+    }
+    // The line's positions must get the whole budget, also once a win is
+    // proven, and a proven child must stay proven.
+    for (int name_idx : {0, 1}) {
+      for (int color_idx : {0, 1}) {
+        const auto& dict = player_options_[name_idx][color_idx];
+        if (classic::HasIntrinsicStoppers(dict)) {
+          throw Exception(
+              "Replaying needs --smart-pruning-factor=0 and "
+              "--minimum-kldgain-per-node=0: the search must not end before "
+              "its visit limit.");
+        }
+        if (!dict.Get<bool>(classic::SearchParams::kStickyEndgamesId)) {
+          throw Exception("Replaying needs --sticky-endgames=true.");
+        }
+#ifdef LC0_CHILDQ_CLASSIC
+        if (kReplayMoveFloor > 0.0f &&
+            dict.Get<int>(childq_classic::SearchParams::kFeSharpCheckpointId) >
+                0) {
+          throw Exception(
+              "--replay-move-floor replaces the sharp forced-exploration "
+              "gate: set --forced-exploration-sharp-checkpoint=0.");
+        }
+#endif
+      }
+    }
+    ReplayPgnReader replay_reader;
+    replay_reader.AddPgnFile(replay_pgn,
+                             options.Get<int>(kReplayVariationPlyId));
+    games_to_replay_ = replay_reader.ReleaseGames();
+    if (games_to_replay_.empty()) {
+      throw Exception("The replay pgn holds no game.");
+    }
+  } else if (kReplayMoveFloor > 0.0f) {
+    throw Exception("--replay-move-floor needs --replay-pgn.");
   }
   if (kPolicyGamesSize > 0 && kValueGamesSize > 0) {
     throw Exception("Can't do both policy and value games at the same time.");
@@ -247,6 +334,12 @@ SelfPlayTournament::SelfPlayTournament(const OptionsDict& options,
                              .GetSubdict(kPlayerColors[color_idx]);
       limits.playouts = dict.Get<int>(kPlayoutsId);
       limits.visits = dict.Get<int>(kVisitsId);
+      limits.record_visits = dict.Get<int>(kRecordVisitsId);
+      if (limits.record_visits != -1 &&
+          (limits.visits <= 0 || limits.record_visits < limits.visits)) {
+        throw Exception(
+            "--record-visits needs --visits, and must be at least --visits.");
+      }
       limits.movetime = dict.Get<int>(kTimeMsId);
 
       if (multi_games_size_ == 0 && limits.playouts == -1 &&
@@ -301,6 +394,18 @@ void SelfPlayTournament::PlayOneGame(int game_number) {
       opening = discard_pile_.back();
       discard_pile_.pop_back();
     }
+  }
+  // Replay: the game starts at the line's start position; its lead-in moves
+  // are the opening (played, not searched), the rest is replayed.
+  const Opening* line_to_replay = nullptr;
+  if (!games_to_replay_.empty()) {
+    line_to_replay = &games_to_replay_[game_number];
+    if (line_to_replay->moves.empty()) return;
+    opening = Opening();
+    opening.start_fen = line_to_replay->start_fen;
+    opening.moves.assign(
+        line_to_replay->moves.begin(),
+        line_to_replay->moves.begin() + line_to_replay->lead_in);
   }
   const int color_idx[2] = {player1_black ? 1 : 0, player1_black ? 0 : 1};
 
@@ -386,6 +491,7 @@ void SelfPlayTournament::PlayOneGame(int game_number) {
     syzygy_tb = syzygy_tb_.get();
   }
   auto& game = **game_iter;
+  if (line_to_replay) game.SetReplay(*line_to_replay, kReplayMoveFloor);
 
   // If kResignPlaythrough == 0, then this comparison is unconditionally true
   const bool enable_resign =
@@ -397,8 +503,9 @@ void SelfPlayTournament::PlayOneGame(int game_number) {
   game.Play(player1_threads, player2_threads, kTraining, syzygy_tb,
             enable_resign);
 
-  // If game was aborted, it's still undecided.
-  if (game.GetGameResult() != GameResult::UNDECIDED) {
+  // If game was aborted, it's still undecided. (A replayed line that reached
+  // its end may be undecided too: its records take the last search's value.)
+  if (game.GetGameResult() != GameResult::UNDECIDED || game.ReplayFinished()) {
     // Game callback.
     GameInfo game_info;
     game_info.game_result = game.GetGameResult();
@@ -411,8 +518,15 @@ void SelfPlayTournament::PlayOneGame(int game_number) {
       game_info.min_false_positive_threshold =
           game.GetWorstEvalForWinnerOrDraw();
     }
+    // A game adjudicated at its first search has played no move, but it holds
+    // the frame of that root (the one whose search carries the proof): write
+    // it. Before, such a game left no file. A game that played a move takes
+    // the first test, as before; one that ended on the board at the book's
+    // exit has no frame and still writes nothing.
     if (kTraining &&
-        game_info.play_start_ply < static_cast<int>(game_info.moves.size())) {
+        (game_info.play_start_ply <
+             static_cast<int>(game_info.moves.size()) ||
+         game.GetTrainingFrameCount() > 0)) {
       TrainingDataWriter writer(game_number);
       game.WriteTrainingData(&writer);
       writer.Finalize();
@@ -423,11 +537,13 @@ void SelfPlayTournament::PlayOneGame(int game_number) {
     // Update tournament stats.
     {
       Mutex::Lock lock(mutex_);
-      int result = game.GetGameResult() == GameResult::DRAW        ? 1
-                   : game.GetGameResult() == GameResult::WHITE_WON ? 0
-                                                                   : 2;
-      if (player1_black) result = 2 - result;
-      ++tournament_info_.results[result][player1_black ? 1 : 0];
+      if (game.GetGameResult() != GameResult::UNDECIDED) {
+        int result = game.GetGameResult() == GameResult::DRAW        ? 1
+                     : game.GetGameResult() == GameResult::WHITE_WON ? 0
+                                                                     : 2;
+        if (player1_black) result = 2 - result;
+        ++tournament_info_.results[result][player1_black ? 1 : 0];
+      }
       tournament_info_.move_count_ += game.move_count_;
       tournament_info_.nodes_total_ += game.nodes_total_;
       tournament_callback_(tournament_info_);
@@ -574,7 +690,9 @@ void SelfPlayTournament::Worker() {
         if ((kTotalGames >= 0 && games_count_ >= kTotalGames) ||
             (kTotalGames == -2 && !openings_.empty() &&
              games_count_ >=
-                 static_cast<int>(openings_.size()) * (mirrored ? 2 : 1)))
+                 static_cast<int>(openings_.size()) * (mirrored ? 2 : 1)) ||
+            (!games_to_replay_.empty() &&
+             games_count_ >= static_cast<int>(games_to_replay_.size())))
           break;
         game_id = games_count_++;
       }

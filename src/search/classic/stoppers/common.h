@@ -40,6 +40,9 @@ void PopulateCommonStopperOptions(RunType for_what, OptionsParser* options);
 // Populates KLDGain and SmartPruning stoppers.
 void PopulateIntrinsicStoppers(ChainedSearchStopper* stopper,
                                const OptionsDict& options);
+// Whether PopulateIntrinsicStoppers would add a stopper, i.e. whether a search
+// with these options can end before its visit limit.
+bool HasIntrinsicStoppers(const OptionsDict& options);
 
 std::unique_ptr<TimeManager> MakeCommonTimeManager(
     std::unique_ptr<TimeManager> child_manager, const OptionsDict& options,
