@@ -27,7 +27,9 @@
 
 #pragma once
 
+#include <cstdint>
 #include <list>
+#include <random>
 
 #include "chess/pgn.h"
 #include "neural/backend.h"
@@ -69,6 +71,11 @@ class SelfPlayTournament {
   ~SelfPlayTournament();
 
  private:
+  // https://nuclear.llnl.gov/CNP/rng/rngman/node4.html
+  using OpeningRandomGenerator =
+      std::linear_congruential_engine<uint64_t, 2862933555777941757ULL,
+                                      3037000493ULL, 0>;
+
   void Worker();
   void PlayOneGame(int game_id);
   void PlayMultiGames(int game_id, size_t game_count);
@@ -86,6 +93,7 @@ class SelfPlayTournament {
   // --replay-pgn: the lines to replay, one game each. Not changed after the
   // constructor.
   std::vector<Opening> games_to_replay_;
+  OpeningRandomGenerator opening_random_ GUARDED_BY(mutex_);
   // Games in progress. Exposed here to be able to abort them in case if
   // Abort(). Stored as list and not vector so that threads can keep iterators
   // to them and not worry that it becomes invalid.
