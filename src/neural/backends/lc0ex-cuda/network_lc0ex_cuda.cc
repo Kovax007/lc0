@@ -71,6 +71,11 @@ constexpr std::string_view kInputValuesName = "/input/plane_values";
 constexpr std::string_view kOutputPolicyName = "/output/policy";
 constexpr std::string_view kOutputWdlName = "/output/wdl";
 constexpr std::string_view kOutputMlhName = "/output/mlh";
+// Optional fourth output: the error head, [batch, 1] float32 in 0..1 -- the
+// net's predicted squared error of its value, which the search's uncertainty
+// weighting reads as EvalResult::e. A program built without it has no such
+// buffer and the backend reports e = 0, as before.
+constexpr std::string_view kOutputErrName = "/output/err";
 constexpr std::size_t kNumOutputPolicy = 1858;
 constexpr std::size_t kNumWdlOutputs = 3;
 
@@ -146,6 +151,8 @@ struct ProgramSpec {
   const lc0ex::BufferInfo* output_policy;
   const lc0ex::BufferInfo* output_wdl;
   const lc0ex::BufferInfo* output_mlh;
+  // Null in an executable without the error output.
+  const lc0ex::BufferInfo* output_err;
 };
 
 pblczero::NeuralExecutable LoadExecutableFile(const std::string& path) {
@@ -723,8 +730,32 @@ class Lc0exCudaBackend final : public Backend {
             {batch_size, 1});
       }
 
+      const auto* output_err = program->FindBuffer(kOutputErrName);
+      if (output_err) {
+        output_err = RequireProgramBuffer(
+            *program, kOutputErrName, pblczero::Buffer::DATA_TYPE_F32,
+            {batch_size, 1});
+      }
+
       programs_.push_back({batch_size, program, input_masks, input_values,
-                           output_policy, output_wdl, output_mlh});
+                           output_policy, output_wdl, output_mlh, output_err});
+    }
+
+    // A batch may run on any rung (and a split batch on two): the error output
+    // is served by all of them or by none.
+    const auto with_err = std::count_if(
+        programs_.begin(), programs_.end(),
+        [](const ProgramSpec& spec) { return spec.output_err != nullptr; });
+    if (with_err != 0 &&
+        static_cast<std::size_t>(with_err) != programs_.size()) {
+      throw Exception("Only " + std::to_string(with_err) + " of the " +
+                      std::to_string(programs_.size()) +
+                      " lc0ex programs have the error output '" +
+                      std::string(kOutputErrName) + "'.");
+    }
+    if (with_err != 0) {
+      CERR << "lc0ex: the executable serves the error output '"
+           << kOutputErrName << "' (EvalResult::e).";
     }
 
     std::sort(programs_.begin(), programs_.end(),
@@ -845,6 +876,9 @@ void Lc0exCudaBackendComputation::ComputeBlocking(
   std::vector<float> wdl(actual_batch * kNumWdlOutputs);
   std::vector<float> mlh;
   if (program.output_mlh) mlh.resize(actual_batch);
+  // Empty when the executable has no error output (every rung or none).
+  std::vector<float> err;
+  if (program.output_err) err.resize(actual_batch);
 
   const auto policy_bytes = std::as_writable_bytes(std::span<float>(policy));
   const auto wdl_bytes = std::as_writable_bytes(std::span<float>(wdl));
@@ -885,6 +919,12 @@ void Lc0exCudaBackendComputation::ComputeBlocking(
             .CopyToHostAsync(mlh_bytes.subspan(offset * sizeof(float)),
                              count * sizeof(float));
       }
+      if (spec.output_err) {
+        const auto err_bytes = std::as_writable_bytes(std::span<float>(err));
+        execution.GetBuffer(*spec.output_err)
+            .CopyToHostAsync(err_bytes.subspan(offset * sizeof(float)),
+                             count * sizeof(float));
+      }
       execution.Synchronize();
     };
 
@@ -913,10 +953,11 @@ void Lc0exCudaBackendComputation::ComputeBlocking(
     if (entry.result.m) {
       *entry.result.m = mlh.empty() ? 0.0f : mlh[sample];
     }
-    // No error output in the artifact: report zero uncertainty, as every other
-    // backend does for a net without an error head (GetEVal()'s default).
-    // Unwritten, the memcache hands the search an uninitialised value.
-    if (entry.result.e) *entry.result.e = 0.0f;
+    // The error head's output when the executable has one ('/output/err').
+    // Without it: report zero uncertainty, as every other backend does for a
+    // net without an error head (GetEVal()'s default). Unwritten, the memcache
+    // hands the search an uninitialised value.
+    if (entry.result.e) *entry.result.e = err.empty() ? 0.0f : err[sample];
   }
 }
 
