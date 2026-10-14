@@ -7,6 +7,8 @@
       top 3
     - |q| and |d| absolute error (value head)
     - |m| absolute error (moves-left head)
+    - |cq| and |cs| absolute error per legal move (child-Q head), when both
+      backends have one
 
   Usage:
     lc0 backendcompare --weights=NET \
@@ -212,7 +214,11 @@ void BackendCompare::Run() {
       }
     }
 
-    Stats kl, q_err, d_err, m_err, p_l1;
+    const bool test_childq = test_backend->GetAttributes().has_childq;
+    const bool ref_childq = ref_backend->GetAttributes().has_childq;
+    const bool compare_childq = test_childq && ref_childq;
+
+    Stats kl, q_err, d_err, m_err, p_l1, cq_err, cs_err;
     size_t top1_match = 0, top3_match = 0, compared = 0, skipped = 0;
     std::vector<std::pair<double, std::string>> worst;
 
@@ -282,6 +288,15 @@ void BackendCompare::Run() {
         q_err.Add(std::fabs(r_test[j].q - r_ref[j].q));
         d_err.Add(std::fabs(r_test[j].d - r_ref[j].d));
         m_err.Add(std::fabs(r_test[j].m - r_ref[j].m));
+        if (compare_childq) {
+          // Per legal move, in the same order as the policy.
+          const EvalResult& t = r_test[j];
+          const EvalResult& r = r_ref[j];
+          for (size_t k = 0; k < t.cq.size() && k < r.cq.size(); ++k) {
+            cq_err.Add(std::fabs(t.cq[k] - r.cq[k]));
+            cs_err.Add(std::fabs(t.cs[k] - r.cs[k]));
+          }
+        }
         ++compared;
 
         if (verbose) worst.emplace_back(this_kl, batch_fens[j]);
@@ -306,6 +321,15 @@ void BackendCompare::Run() {
     PrintRow("|q_test - q_ref|", q_err);
     PrintRow("|d_test - d_ref|", d_err);
     PrintRow("|m_test - m_ref|", m_err);
+    if (compare_childq) {
+      PrintRow("|cq_test - cq_ref| (move)", cq_err);
+      PrintRow("|cs_test - cs_ref| (move)", cs_err);
+    } else {
+      std::cout << "child-Q not compared: test has_childq="
+                << (test_childq ? "yes" : "no")
+                << ", ref has_childq=" << (ref_childq ? "yes" : "no")
+                << std::endl;
+    }
     std::cout << std::endl;
     std::cout << std::fixed << std::setprecision(4)
               << "top-1 agreement          : "
