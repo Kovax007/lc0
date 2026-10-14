@@ -41,6 +41,7 @@
 #include "neural/register.h"
 #include "neural/shared_params.h"
 #include "utils/exception.h"
+#include "utils/logging.h"
 #include "utils/mutex.h"
 #include "utils/optionsdict.h"
 
@@ -190,12 +191,16 @@ BackendAttributes AggregateDemuxAttributes(
       .suggested_num_search_threads = 1,
       .recommended_batch_size = std::numeric_limits<int>::max(),
       .maximum_batch_size = std::numeric_limits<int>::max(),
+      .has_childq = true,
   };
   for (const auto& child : children) {
     const auto& attr = child->backend_->GetAttributes();
     result.has_mlh &= attr.has_mlh;
     result.has_wdl &= attr.has_wdl;
     result.runs_on_cpu &= attr.runs_on_cpu;
+    // Child-Q only when every child fills it, as the old-API demux did through
+    // NetworkCapabilities::Merge().
+    result.has_childq &= attr.has_childq;
     result.recommended_batch_size =
         std::min(result.recommended_batch_size, attr.recommended_batch_size);
     result.maximum_batch_size =
@@ -289,6 +294,13 @@ DemuxingBackend::DemuxingBackend(const OptionsDict& options)
   }
 
   attrs_ = AggregateDemuxAttributes(backends_, batch_step_);
+  if (!attrs_.has_childq &&
+      std::any_of(backends_.begin(), backends_.end(), [](const auto& child) {
+        return child->backend_->GetAttributes().has_childq;
+      })) {
+    CERR << "demux: some child backends have no child-Q head; child-Q is "
+            "disabled for all of them.";
+  }
   UpdateConfiguration(options);
 }
 
@@ -336,6 +348,10 @@ BackendComputation::AddInputResult DemuxingComputation::AddInput(
   assert(ticket < static_cast<size_t>(backend_->attrs_.maximum_batch_size));
   const size_t child =
       (start_index_ + ticket / backend_->batch_step_) % computations_.size();
+  // The child writes cq / cs straight into the caller's spans. Without child-Q
+  // on every child, no child gets them, so no sample is filled by one child and
+  // left untouched by another.
+  if (!backend_->attrs_.has_childq) result.cq = result.cs = {};
   // We don't reclaim capacity for FETCHED_IMMEDIATELY as it's not trivial at
   // all without a lock.
   return computations_[child]->AddInput(pos, result);
