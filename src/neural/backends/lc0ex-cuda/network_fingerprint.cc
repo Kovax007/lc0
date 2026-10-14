@@ -173,6 +173,23 @@ pblczero::Net BuildNetworkFingerprint(const pblczero::Net& network) {
     MarkEncoder(target_weights->add_encoder());
   }
 
+  // The child-Q head is not a Weights layer: a net carries it as ONNX
+  // initializers and names its two outputs in OnnxModel fields 8 and 9. The
+  // names enter the fingerprint, so an executable built with the head accepts
+  // only a net that declares it, and the reverse.
+  if (network.has_onnx_model()) {
+    const auto& onnx = network.onnx_model();
+    if (onnx.has_output_childq_mean() || onnx.has_output_childq_var()) {
+      auto* target_onnx = fingerprint.mutable_onnx_model();
+      if (onnx.has_output_childq_mean()) {
+        target_onnx->set_output_childq_mean(onnx.output_childq_mean());
+      }
+      if (onnx.has_output_childq_var()) {
+        target_onnx->set_output_childq_var(onnx.output_childq_var());
+      }
+    }
+  }
+
   return fingerprint;
 }
 

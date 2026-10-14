@@ -50,7 +50,7 @@ const OptionId SharedBackendParams::kPolicyBlend3Id{
     "The first head gets 1 minus the sum of the others. -10 = not set: the weights file plays "
     "with its own weights."};
 const OptionId SharedBackendParams::kHistoryFill{
-    "history-fill-new", "HistoryFill",
+    "history-fill", "HistoryFill",
     "Neural network uses 7 previous board positions in addition to the current "
     "one. During the first moves of the game such historical positions don't "
     "exist, but they can be synthesized. This parameter defines when to "
