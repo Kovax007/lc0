@@ -266,8 +266,10 @@ if get_option('childq_classic')
   # Selfplay's --selfplay-search=childq-classic and the training-data overload
   # for its tree are compiled only with the compartment.
   add_project_arguments('-DLC0_CHILDQ_CLASSIC', language : 'cpp')
+  # node.cc is a common file, like classic/node.cc: trainingdata.cc (common)
+  # uses its Node, so lc0_lib (the tests) does not link without it.
+  common_files += 'src/search/childq_classic/node.cc'
   files += [
-    'src/search/childq_classic/node.cc',
     'src/search/childq_classic/params.cc',
     'src/search/childq_classic/search.cc',
     'src/search/childq_classic/wrapper.cc',
