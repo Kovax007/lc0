@@ -40,6 +40,9 @@ struct SharedBackendParams {
 
   static const OptionId kPolicySoftmaxTemp;
   static const OptionId kHistoryFill;
+  static const OptionId kPolicyBlend1Id;
+  static const OptionId kPolicyBlend2Id;
+  static const OptionId kPolicyBlend3Id;
   static const OptionId kWeightsId;
   static const OptionId kBackendId;
   static const OptionId kBackendOptionsId;

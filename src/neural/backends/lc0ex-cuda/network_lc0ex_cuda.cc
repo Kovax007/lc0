@@ -36,6 +36,7 @@
 #include <limits>
 #include <map>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -318,8 +319,234 @@ void CopyTensorToHostStaging(const lc0ex::BufferInfo& buffer,
       source.data(), destination_staging.data() + buffer.offset_bytes);
 }
 
+// Half-precision bits of a float, rounded to nearest even: what the weights-file tools do when they
+// write a half-precision tensor.
+std::uint16_t HalfBitsFromFloat(float value) {
+  std::uint32_t x;
+  std::memcpy(&x, &value, sizeof(x));
+  const std::uint16_t sign = static_cast<std::uint16_t>((x >> 16) & 0x8000u);
+  x &= 0x7fffffffu;
+  if (x >= 0x7f800000u) {
+    return static_cast<std::uint16_t>(sign | 0x7c00u | (x > 0x7f800000u ? 0x200u : 0u));
+  }
+  if (x >= 0x477ff000u) return static_cast<std::uint16_t>(sign | 0x7c00u);
+  if (x < 0x33000001u) return sign;
+  const int exponent = static_cast<int>(x >> 23) - 127;
+  const std::uint32_t mantissa = (x & 0x7fffffu) | 0x800000u;
+  const int shift = exponent < -14 ? 13 + (-14 - exponent) : 13;
+  const std::uint32_t half_exponent =
+      exponent < -14 ? 0u : static_cast<std::uint32_t>(exponent + 15);
+  std::uint32_t result = mantissa >> shift;
+  const std::uint32_t remainder = mantissa & ((1u << shift) - 1u);
+  const std::uint32_t halfway = 1u << (shift - 1);
+  if (remainder > halfway || (remainder == halfway && (result & 1u))) ++result;
+  if (half_exponent != 0) result += (half_exponent - 1u) << 10;
+  return static_cast<std::uint16_t>(sign | result);
+}
+
+const pblczero::TensorProto& RequireBlendTensor(
+    const std::unordered_map<std::string, const pblczero::TensorProto*>&
+        initializers,
+    const std::string& name, int data_type, std::uint64_t elements) {
+  const auto it = initializers.find(name);
+  if (it == initializers.end()) {
+    throw Exception("policy_blend_* is set, but the weights file has no '" +
+                    name + "': it is not a blend weights file.");
+  }
+  const auto& tensor = *it->second;
+  if (static_cast<int>(tensor.data_type()) != data_type ||
+      static_cast<std::uint64_t>(tensor.raw_data().size()) != elements * 4) {
+    throw Exception("policy_blend_*: unexpected type or size of '" + name +
+                    "'.");
+  }
+  return tensor;
+}
+
+constexpr float kPolicyBlendNotSet = -9.99f;
+
+std::array<float, 3> PolicyBlendUci(const OptionsDict& options) {
+  return {options.Get<float>(SharedBackendParams::kPolicyBlend1Id),
+          options.Get<float>(SharedBackendParams::kPolicyBlend2Id),
+          options.Get<float>(SharedBackendParams::kPolicyBlend3Id)};
+}
+
+// Blend weights for a weights file with a composed policy head. Backend options policy_blend_0,
+// policy_blend_1, ... give every head's weight and win; otherwise the UCI options PolicyBlend1..3
+// give the weights of the heads after the first, and the first head gets 1 minus their sum.
+// Empty = nothing set: the file plays with its own weights.
+std::vector<double> ReadPolicyBlendWeights(const OptionsDict& backend_options,
+                                           const OptionsDict& options) {
+  std::vector<double> weights;
+  for (int i = 0;; ++i) {
+    const std::string key = "policy_blend_" + std::to_string(i);
+    if (backend_options.Exists<float>(key)) {
+      weights.push_back(backend_options.Get<float>(key));
+    } else if (backend_options.Exists<int>(key)) {
+      weights.push_back(backend_options.Get<int>(key));
+    } else {
+      break;
+    }
+  }
+  if (!weights.empty()) return weights;
+  const auto uci = PolicyBlendUci(options);
+  int last = -1;
+  for (int i = 0; i < 3; ++i) {
+    if (uci[i] > kPolicyBlendNotSet) last = i;
+  }
+  if (last < 0) return weights;
+  weights.assign(static_cast<std::size_t>(last) + 2, 0.0);
+  double sum = 0.0;
+  for (int i = 0; i <= last; ++i) {
+    if (uci[i] > kPolicyBlendNotSet) {
+      weights[static_cast<std::size_t>(i) + 1] = uci[i];
+      sum += uci[i];
+    }
+  }
+  weights[0] = 1.0 - sum;
+  return weights;
+}
+
+// A weights file may carry a policy head made of several heads side by side (a geometric blend of
+// the heads, served as one wide head) together with the heads' unscaled tensors under
+// /policy/blend/. With blend weights given (ReadPolicyBlendWeights), the weight-dependent tensors of
+// the head are rebuilt here for those weights, with the arithmetic of the tool that composes such
+// a file: queries scaled by w_i * sqrt(D / d_i) per block, promotion by w_i per block, the
+// pair-read tables as the sum of w_i times head i's table.
+void ApplyPolicyBlend(
+    const std::unordered_map<std::string, const pblczero::TensorProto*>&
+        initializers,
+    const lc0ex::Executable& executable, std::vector<double> weights,
+    std::span<std::byte> staging) {
+  if (weights.empty()) return;
+  const auto widths_it = initializers.find("/policy/blend/widths");
+  if (widths_it == initializers.end()) {
+    throw Exception(
+        "Policy blend weights are set, but the weights file has no "
+        "'/policy/blend/widths': it is not a blend weights file.");
+  }
+  const std::size_t heads = widths_it->second->raw_data().size() / 4;
+  if (weights.size() > heads) {
+    throw Exception("Policy blend: " + std::to_string(weights.size()) +
+                    " weights for a weights file of " + std::to_string(heads) +
+                    " heads.");
+  }
+  weights.resize(heads, 0.0);
+
+  const auto& widths_tensor = *widths_it->second;
+  if (heads == 0 || static_cast<int>(widths_tensor.data_type()) != 6 ||
+      widths_tensor.raw_data().size() != heads * 4) {
+    throw Exception("Policy blend: unexpected type or size of "
+                    "'/policy/blend/widths'.");
+  }
+  std::vector<std::int32_t> widths(heads);
+  std::memcpy(widths.data(), widths_tensor.raw_data().data(), heads * 4);
+  std::uint64_t total = 0;
+  for (const auto width : widths) {
+    if (width <= 0) throw Exception("policy_blend_*: bad block width.");
+    total += static_cast<std::uint64_t>(width);
+  }
+
+  const auto floats = [&](const std::string& name, std::uint64_t elements) {
+    const auto& tensor = RequireBlendTensor(initializers, name, 1, elements);
+    std::vector<float> values(elements);
+    std::memcpy(values.data(), tensor.raw_data().data(), elements * 4);
+    return values;
+  };
+  const auto require_buffer = [&](const std::string& name) {
+    const auto* buffer = executable.FindBuffer(name);
+    if (!buffer || static_cast<int>(buffer->data_type) != 10) {
+      throw Exception("policy_blend_*: the program has no half-precision buffer '" +
+                      name + "'.");
+    }
+    return buffer;
+  };
+  const auto write = [&](const lc0ex::BufferInfo& buffer,
+                         const std::vector<std::uint16_t>& halves) {
+    if (buffer.size_bytes != halves.size() * 2) {
+      throw Exception("policy_blend_*: the program's buffer '" + buffer.name +
+                      "' does not fit the blend tables.");
+    }
+    CopyTensorToHostStaging(
+        buffer, std::as_bytes(std::span<const std::uint16_t>(halves)), staging);
+  };
+
+  // Column c of the queries and row c of the promotion layer belong to block_of[c].
+  std::vector<float> query_scale(total), promotion_scale(total);
+  std::uint64_t column = 0;
+  for (std::size_t i = 0; i < heads; ++i) {
+    const float q = static_cast<float>(
+        weights[i] * std::sqrt(static_cast<double>(total) / widths[i]));
+    const float p = static_cast<float>(weights[i]);
+    for (std::int32_t k = 0; k < widths[i]; ++k, ++column) {
+      query_scale[column] = q;
+      promotion_scale[column] = p;
+    }
+  }
+
+  const auto* q_w = require_buffer("/policy/Q/w");
+  if (q_w->shape.size() != 2 || q_w->shape[1] != total) {
+    throw Exception("policy_blend_*: the program's policy head is not as wide as the blend tables.");
+  }
+  const std::uint64_t rows = q_w->shape[0];
+  {
+    const auto raw = floats("/policy/blend/Q_w", rows * total);
+    std::vector<std::uint16_t> halves(raw.size());
+    for (std::uint64_t r = 0; r < rows; ++r) {
+      for (std::uint64_t c = 0; c < total; ++c) {
+        const float scaled = raw[r * total + c] * query_scale[c];
+        halves[r * total + c] = HalfBitsFromFloat(scaled);
+      }
+    }
+    write(*q_w, halves);
+  }
+  {
+    const auto raw = floats("/policy/blend/Q_b", total);
+    std::vector<std::uint16_t> halves(total);
+    for (std::uint64_t c = 0; c < total; ++c) {
+      const float scaled = raw[c] * query_scale[c];
+      halves[c] = HalfBitsFromFloat(scaled);
+    }
+    write(*require_buffer("/policy/Q/b"), halves);
+  }
+  {
+    const auto raw = floats("/policy/blend/promotion_w", total * 4);
+    std::vector<std::uint16_t> halves(raw.size());
+    for (std::uint64_t c = 0; c < total; ++c) {
+      for (std::uint64_t j = 0; j < 4; ++j) {
+        const float scaled = raw[c * 4 + j] * promotion_scale[c];
+        halves[c * 4 + j] = HalfBitsFromFloat(scaled);
+      }
+    }
+    write(*require_buffer("/policy/promotion/w"), halves);
+  }
+  for (const char* table : {"scaled_coefficients", "constant_bias"}) {
+    const auto* buffer = require_buffer(std::string("/policy/pair/") + table);
+    const std::uint64_t elements = buffer->size_bytes / 2;
+    const auto raw =
+        floats(std::string("/policy/blend/pair_") + table, heads * elements);
+    std::vector<std::uint16_t> halves(elements);
+    for (std::uint64_t j = 0; j < elements; ++j) {
+      double sum = 0.0;
+      for (std::size_t i = 0; i < heads; ++i) {
+        sum += weights[i] * static_cast<double>(raw[i * elements + j]);
+      }
+      halves[j] = HalfBitsFromFloat(static_cast<float>(sum));
+    }
+    write(*buffer, halves);
+  }
+
+  std::string text;
+  for (std::size_t i = 0; i < heads; ++i) {
+    text += (i ? " : " : "") + std::to_string(weights[i]);
+  }
+  CERR << "Policy head blend weights from the start option: " << text << " ("
+       << heads << " heads, " << total << " wide).";
+}
+
+
 void UploadWeights(const WeightsFile& weights, lc0ex::Executable& executable,
-                   const OptionsDict& backend_options) {
+                   const OptionsDict& backend_options,
+                   const std::vector<double>& policy_blend) {
   std::optional<WeightsFile> converted_weights;
   if (!weights.has_onnx_model()) {
     CERR << "Converting weights to ONNX first.";
@@ -370,6 +597,9 @@ void UploadWeights(const WeightsFile& weights, lc0ex::Executable& executable,
   for (const auto& initializer : onnx.graph().initializer()) {
     const auto* buffer = executable.FindBuffer(initializer.name());
     if (!buffer) {
+      if (std::string_view(initializer.name()).starts_with("/policy/blend/")) {
+        continue;  // the heads' unscaled tensors of a blend weights file
+      }
       CERR << "WARNING: ONNX initializer '" << initializer.name()
            << "' has no corresponding lc0ex buffer.";
       continue;
@@ -381,6 +611,8 @@ void UploadWeights(const WeightsFile& weights, lc0ex::Executable& executable,
         initializer.raw_data().size());
     CopyTensorToHostStaging(*buffer, source, staging);
   }
+
+  ApplyPolicyBlend(initializers_by_name, executable, policy_blend, staging);
 
   executable.CopyPersistentFromHost(staging);
 }
@@ -536,7 +768,8 @@ class Lc0exCudaBackend final : public Backend {
                  backend_options.GetOrDefault<std::string>("graph", "auto")));
     executable_ = runtime_->Load(executable_proto);
     InitializePrograms();
-    UploadWeights(weights, *executable_, backend_options);
+    UploadWeights(weights, *executable_, backend_options,
+                  ReadPolicyBlendWeights(backend_options, options));
   }
 
   ~Lc0exCudaBackend() override {
@@ -566,6 +799,12 @@ class Lc0exCudaBackend final : public Backend {
         options.Get<std::string>(SharedBackendParams::kWeightsId)) {
       return NEED_RESTART;
     }
+    // The blend weights go into the uploaded weights: a change needs a new backend.
+    const auto policy_blend = PolicyBlendUci(options);
+    if (policy_blend_uci_ && *policy_blend_uci_ != policy_blend) {
+      return NEED_RESTART;
+    }
+    policy_blend_uci_ = policy_blend;
 
     inverse_policy_temperature_ =
         1.0f / options.Get<float>(SharedBackendParams::kPolicySoftmaxTemp);
@@ -744,6 +983,7 @@ class Lc0exCudaBackend final : public Backend {
       executions_;
   const std::string backend_options_;
   const std::string weights_path_;
+  std::optional<std::array<float, 3>> policy_blend_uci_;
   const pblczero::NetworkFormat::InputFormat input_format_;
   float inverse_policy_temperature_ = 1.0f;
   FillEmptyHistory fill_empty_history_ = FillEmptyHistory::NO;

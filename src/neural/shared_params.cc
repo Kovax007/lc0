@@ -34,6 +34,21 @@ const OptionId SharedBackendParams::kPolicySoftmaxTemp{
     "policy-softmax-temp", "PolicyTemperature",
     "Policy softmax temperature. Higher values make priors of move candidates "
     "closer to each other, widening the search."};
+const OptionId SharedBackendParams::kPolicyBlend1Id{
+    "policy-blend-1", "PolicyBlend1",
+    "Weight of head 2 of a blend weights file (a policy head made of several heads side by side). "
+    "The first head gets 1 minus the sum of the others. -10 = not set: the weights file plays "
+    "with its own weights."};
+const OptionId SharedBackendParams::kPolicyBlend2Id{
+    "policy-blend-2", "PolicyBlend2",
+    "Weight of head 3 of a blend weights file (a policy head made of several heads side by side). "
+    "The first head gets 1 minus the sum of the others. -10 = not set: the weights file plays "
+    "with its own weights."};
+const OptionId SharedBackendParams::kPolicyBlend3Id{
+    "policy-blend-3", "PolicyBlend3",
+    "Weight of head 4 of a blend weights file (a policy head made of several heads side by side). "
+    "The first head gets 1 minus the sum of the others. -10 = not set: the weights file plays "
+    "with its own weights."};
 const OptionId SharedBackendParams::kHistoryFill{
     "history-fill-new", "HistoryFill",
     "Neural network uses 7 previous board positions in addition to the current "
@@ -69,6 +84,9 @@ void SharedBackendParams::Populate(OptionsParser* options) {
   options->Add<FloatOption>(kPolicySoftmaxTemp, 0.1f, 10.0f) = 1.359f;
   std::vector<std::string> history_fill_opt{"no", "fen_only", "always"};
   options->Add<ChoiceOption>(kHistoryFill, history_fill_opt) = "fen_only";
+  options->Add<FloatOption>(kPolicyBlend1Id, -10.0f, 10.0f) = -10.0f;
+  options->Add<FloatOption>(kPolicyBlend2Id, -10.0f, 10.0f) = -10.0f;
+  options->Add<FloatOption>(kPolicyBlend3Id, -10.0f, 10.0f) = -10.0f;
 
 #if defined(EMBED)
   options->Add<StringOption>(SharedBackendParams::kWeightsId) = kEmbed;
