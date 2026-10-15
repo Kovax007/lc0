@@ -211,6 +211,8 @@ class RecordReplayNetwork : public Network {
     } else {
       capabilities_.Merge(networks_.back()->GetCapabilities());
     }
+    // Recordings do not carry the child-Q head.
+    capabilities_.has_childq = false;
   }
 
   std::unique_ptr<NetworkComputation> NewComputation() override {

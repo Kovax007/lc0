@@ -47,6 +47,8 @@ struct BackendAttributes {
   int suggested_num_search_threads;
   int recommended_batch_size;
   int maximum_batch_size;
+  // Whether the backend fills the child-Q head (EvalResult::cq and ::cs).
+  bool has_childq = false;
 };
 
 struct EvalResultPtr {
@@ -54,6 +56,11 @@ struct EvalResultPtr {
   float* d = nullptr;
   float* m = nullptr;
   std::span<float> p = {};
+  // Child-Q mean and standard deviation per legal move, same order as p, in
+  // the side-to-move frame of the evaluated position, raw (no softmax or
+  // temperature). Only requested when the backend has_childq.
+  std::span<float> cq = {};
+  std::span<float> cs = {};
 };
 
 struct EvalResult {
@@ -61,9 +68,11 @@ struct EvalResult {
   float d;
   float m;
   std::vector<float> p;
+  std::vector<float> cq;
+  std::vector<float> cs;
 
   EvalResultPtr AsPtr() {
-    return EvalResultPtr{.q = &q, .d = &d, .m = &m, .p = p};
+    return EvalResultPtr{.q = &q, .d = &d, .m = &m, .p = p, .cq = cq, .cs = cs};
   }
 };
 

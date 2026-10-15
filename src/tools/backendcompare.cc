@@ -7,6 +7,8 @@
       top 3
     - |q| and |d| absolute error (value head)
     - |m| absolute error (moves-left head)
+    - |cq| and |cs| absolute error per legal move (child-Q head), when both
+      backends have one
 
   Usage:
     lc0 backendcompare --weights=NET \
@@ -55,6 +57,11 @@ const OptionId kBatchSizeId{"batch-size", "",
                             "Positions per backend call."};
 const OptionId kVerboseId{"verbose", "",
                           "Print the worst positions by policy KL."};
+const OptionId kDumpTestId{
+    "dump-test", "",
+    "Write the test backend's raw outputs to this file (per position: q, d, "
+    "m, then the legal-move policy, all float32), so that two builds can be "
+    "compared byte for byte."};
 
 struct Stats {
   std::vector<double> v;
@@ -124,6 +131,7 @@ void BackendCompare::Run() {
   options.Add<IntOption>(kMaxPositionsId, 1, 100000000) = 10000;
   options.Add<IntOption>(kBatchSizeId, 1, 1024) = 32;
   options.Add<BoolOption>(kVerboseId) = false;
+  options.Add<StringOption>(kDumpTestId) = "";
 
   if (!options.ProcessAllFlags()) return;
 
@@ -196,8 +204,21 @@ void BackendCompare::Run() {
     const size_t batch_size =
         static_cast<size_t>(base.Get<int>(kBatchSizeId));
     const bool verbose = base.Get<bool>(kVerboseId);
+    const std::string dump_path = base.Get<std::string>(kDumpTestId);
+    std::ofstream dump;
+    if (!dump_path.empty()) {
+      dump.open(dump_path, std::ios::binary | std::ios::trunc);
+      if (!dump) {
+        std::cerr << "Cannot open " << dump_path << std::endl;
+        return;
+      }
+    }
 
-    Stats kl, q_err, d_err, m_err, p_l1;
+    const bool test_childq = test_backend->GetAttributes().has_childq;
+    const bool ref_childq = ref_backend->GetAttributes().has_childq;
+    const bool compare_childq = test_childq && ref_childq;
+
+    Stats kl, q_err, d_err, m_err, p_l1, cq_err, cs_err;
     size_t top1_match = 0, top3_match = 0, compared = 0, skipped = 0;
     std::vector<std::pair<double, std::string>> worst;
 
@@ -236,6 +257,15 @@ void BackendCompare::Run() {
       std::vector<EvalResult> r_test = test_backend->EvaluateBatch(batch);
       std::vector<EvalResult> r_ref = ref_backend->EvaluateBatch(batch);
 
+      if (dump.is_open()) {
+        for (const EvalResult& r : r_test) {
+          const float head[3] = {r.q, r.d, r.m};
+          dump.write(reinterpret_cast<const char*>(head), sizeof(head));
+          dump.write(reinterpret_cast<const char*>(r.p.data()),
+                     r.p.size() * sizeof(float));
+        }
+      }
+
       for (size_t j = 0; j < batch.size(); ++j) {
         const std::vector<float>& pt = r_test[j].p;
         const std::vector<float>& pr = r_ref[j].p;
@@ -258,6 +288,15 @@ void BackendCompare::Run() {
         q_err.Add(std::fabs(r_test[j].q - r_ref[j].q));
         d_err.Add(std::fabs(r_test[j].d - r_ref[j].d));
         m_err.Add(std::fabs(r_test[j].m - r_ref[j].m));
+        if (compare_childq) {
+          // Per legal move, in the same order as the policy.
+          const EvalResult& t = r_test[j];
+          const EvalResult& r = r_ref[j];
+          for (size_t k = 0; k < t.cq.size() && k < r.cq.size(); ++k) {
+            cq_err.Add(std::fabs(t.cq[k] - r.cq[k]));
+            cs_err.Add(std::fabs(t.cs[k] - r.cs[k]));
+          }
+        }
         ++compared;
 
         if (verbose) worst.emplace_back(this_kl, batch_fens[j]);
@@ -282,6 +321,15 @@ void BackendCompare::Run() {
     PrintRow("|q_test - q_ref|", q_err);
     PrintRow("|d_test - d_ref|", d_err);
     PrintRow("|m_test - m_ref|", m_err);
+    if (compare_childq) {
+      PrintRow("|cq_test - cq_ref| (move)", cq_err);
+      PrintRow("|cs_test - cs_ref| (move)", cs_err);
+    } else {
+      std::cout << "child-Q not compared: test has_childq="
+                << (test_childq ? "yes" : "no")
+                << ", ref has_childq=" << (ref_childq ? "yes" : "no")
+                << std::endl;
+    }
     std::cout << std::endl;
     std::cout << std::fixed << std::setprecision(4)
               << "top-1 agreement          : "
