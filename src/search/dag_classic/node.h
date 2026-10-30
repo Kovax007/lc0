@@ -212,7 +212,11 @@ class EdgeRef {
 
   EdgeRef(Move* move, uint16_t* policy) : move_(move), policy_(policy) {}
   EdgeRef(const EdgeRef& other) = delete;
-  EdgeRef(EdgeRef&& other) : edge_{*other.move_, *other.policy_} {
+  // `other` may itself hold a value (move_ null): std::sort's heap fallback
+  // moves an element twice.
+  EdgeRef(EdgeRef&& other)
+      : edge_{other.move_ ? *other.move_ : other.edge_.move_,
+              other.move_ ? *other.policy_ : other.edge_.p_} {
   }
 
   EdgeRef& operator=(Move move) {
