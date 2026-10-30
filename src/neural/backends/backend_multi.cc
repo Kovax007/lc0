@@ -85,24 +85,30 @@ class MultiBackendComputation final : public BackendComputation {
         distribution_(distribution),
         cursor_(subs_.empty() ? 0 : start_device % subs_.size()) {}
 
-  size_t UsedBatchSize() const override { return used_; }
+  size_t UsedBatchSize() const override {
+    return used_.load(std::memory_order_relaxed);
+  }
 
   AddInputResult AddInput(const EvalPosition& pos,
                           EvalResultPtr result) override {
-    const AddInputResult status = subs_[cursor_]->AddInput(pos, result);
+    // Task workers call AddInput concurrently, so `split` takes a ticket
+    // instead of moving a shared cursor: a plain cursor loses increments under
+    // that race and can push one device past its maximum batch size.
+    // `roundrobin` keeps a whole gather on the computation's start device.
+    const size_t device =
+        distribution_ == Distribution::kSplit
+            ? (cursor_ + ticket_.fetch_add(1, std::memory_order_relaxed)) %
+                  subs_.size()
+            : cursor_;
+    const AddInputResult status = subs_[device]->AddInput(pos, result);
     if (status == ENQUEUED_FOR_EVAL) {
-      ++used_;
-      // Only `split` moves the cursor per input; `roundrobin` keeps a whole
-      // gather on one device and advances once per computation instead.
-      if (distribution_ == Distribution::kSplit) {
-        cursor_ = (cursor_ + 1) % subs_.size();
-      }
+      used_.fetch_add(1, std::memory_order_relaxed);
     }
     return status;
   }
 
   void ComputeBlocking(ComputationCallback callback) override {
-    if (used_ == 0) {
+    if (used_.load(std::memory_order_relaxed) == 0) {
       callback(ComputationEvent::FIRST_BACKEND_IDLE);
       return;
     }
@@ -132,8 +138,9 @@ class MultiBackendComputation final : public BackendComputation {
  private:
   std::vector<std::unique_ptr<BackendComputation>> subs_;
   Distribution distribution_;
-  size_t cursor_ = 0;
-  size_t used_ = 0;
+  const size_t cursor_ = 0;
+  std::atomic<size_t> ticket_{0};
+  std::atomic<size_t> used_{0};
 };
 
 class MultiBackend final : public Backend {
