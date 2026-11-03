@@ -34,6 +34,7 @@
 #include <array>
 #include <bit>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <execution>
 #include <memory>
@@ -48,6 +49,8 @@ namespace hn = hwy::HWY_NAMESPACE;
 
 #ifdef _MSC_VER
 #include <intrin.h>
+#else
+#include <sys/mman.h>
 #endif
 
 namespace lczero {
@@ -195,7 +198,20 @@ class HashKeyedCache {
 #if defined(_MSC_VER)
     void* ptr = _aligned_malloc(bytes, kCacheLineSize);
 #else
-    void* ptr = std::aligned_alloc(kCacheLineSize, bytes);
+    // Transparent huge pages for the big caches (a random bucket is otherwise
+    // a TLB miss on 4 KB pages). On by default; LC0_HASH_HUGEPAGES=0 turns it off.
+    static const bool huge = [] {
+      const char* value = std::getenv("LC0_HASH_HUGEPAGES");
+      return value == nullptr || value[0] != '0';
+    }();
+    constexpr size_t kHugePage = size_t{2} << 20;
+    const size_t huge_bytes = (bytes + kHugePage - 1) / kHugePage * kHugePage;
+    void* ptr = huge && bytes >= kHugePage
+                    ? std::aligned_alloc(kHugePage, huge_bytes)
+                    : std::aligned_alloc(kCacheLineSize, bytes);
+    if (huge && ptr && bytes >= kHugePage) {
+      madvise(ptr, huge_bytes, MADV_HUGEPAGE);
+    }
 #endif
     bool clean_exit = false;
     absl::Cleanup cleanup([ptr, &clean_exit]() {
