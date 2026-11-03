@@ -609,8 +609,12 @@ class DemuxingComputation final : public BackendComputation {
   }
 
   void NotifyComplete() {
+    // speed lane 10-31: read what this needs from *this BEFORE the decrement. The decrement that reaches 0 releases the
+    // waiter in ComputeBlocking, whose search worker may free this computation at once; reading backend_ after it was a
+    // use-after-free (GPF on rig2 with the engine pinned, demux over random children).
+    const bool uses_cpu_backend = backend_->uses_cpu_backend_;
     int outstanding = dataready_.fetch_sub(1, std::memory_order_acq_rel);
-    if (backend_->uses_cpu_backend_ && outstanding == 1) {
+    if (uses_cpu_backend && outstanding == 1) {
       last_done_.store(1, std::memory_order_release);
       last_done_.notify_one();
     }
