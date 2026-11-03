@@ -955,7 +955,19 @@ void TaskQueue::RunTasks(int tid) {
   }
 }
 
-void TaskQueue::PickTask::operator()(int tid) { DoTask(tid); }
+namespace {
+thread_local int pick_task_depth = 0;
+}  // namespace
+
+void TaskQueue::PickTask::operator()(int tid) {
+  struct DepthScope {
+    DepthScope() { ++pick_task_depth; }
+    ~DepthScope() { --pick_task_depth; }
+  } depth_scope;
+  DoTask(tid);
+}
+
+int TaskQueue::PickTask::Depth() { return pick_task_depth; }
 
 TaskQueue::PickTask::~PickTask() {}
 
@@ -1234,8 +1246,12 @@ void SearchWorker::MaybeOutputInfoTask::Reset(int tid, int task_workers) {
 }
 
 void SearchWorker::MaybeOutputInfoTask::DoTask(int tid) {
-  if (tid == worker_id_ || tid < task_workers_) {
-    // Output is only allowed from task workers or from the scheduling thread.
+  // Output is only allowed from task workers or from the scheduling thread,
+  // and only when this task runs at top level. Nested inside another task, the
+  // outer task may belong to a gather or backup which holds nodes_mutex_
+  // exclusively and waits for it, and Search::MaybeOutputInfo would wait for
+  // nodes_mutex_ forever. Skipping one output changes no search state.
+  if ((tid == worker_id_ || tid < task_workers_) && Depth() == 1) {
     worker_.MaybeOutputInfo();
   }
   done_.store(1, std::memory_order_release);

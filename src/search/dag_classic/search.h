@@ -187,6 +187,12 @@ class TaskQueue {
 
     void operator()(int tid);
 
+    // The number of tasks in progress on the calling thread. Inside DoTask, 1
+    // means the task runs at top level and more than 1 means it runs nested
+    // inside another task (SubmitTasks and the Wait loops process queued tasks
+    // while their own task is in progress).
+    static int Depth();
+
     // Dervied class should implement it if there is need to wait for a specific
     // task completing. Default implementation is to do nothing.
     virtual void Wait(int tid) const { std::ignore = tid; };
