@@ -50,6 +50,8 @@
 #include "absl/algorithm/container.h"
 #include "neural/backend.h"
 #include "neural/encoder.h"
+#include "neural/factory.h"
+#include "neural/network.h"
 #include "neural/loader.h"
 #include "neural/onnx/converter.h"
 #include "neural/register.h"
@@ -61,6 +63,7 @@
 #include "utils/exception.h"
 #include "utils/fastmath.h"
 #include "utils/logging.h"
+#include "utils/trace.h"
 
 namespace lczero {
 namespace {
@@ -516,7 +519,22 @@ class Lc0exCudaBackend final : public Backend {
         weights_path_(options.Get<std::string>(SharedBackendParams::kWeightsId)),
         input_format_(weights.format().network_format().input()) {
     UpdateConfiguration(options);
+    Setup(weights, backend_options);
+  }
 
+  // The old-interface path (lc0ex-cuda-net, for demux). No search options:
+  // demux encodes the inputs and applies the policy softmax itself.
+  struct NetworkPath {};
+  Lc0exCudaBackend(const WeightsFile& weights,
+                   const OptionsDict& backend_options, NetworkPath)
+      : attributes_(MakeBackendAttributes(weights)),
+        execution_semaphore_(
+            backend_options.GetOrDefault<int>("concurrency", 1)),
+        input_format_(weights.format().network_format().input()) {
+    Setup(weights, backend_options);
+  }
+
+  void Setup(const WeightsFile& weights, const OptionsDict& backend_options) {
     const int concurrency =
         std::max(1, backend_options.GetOrDefault<int>("concurrency", 1));
     execution_slot_pool_.in_use.assign(concurrency, false);
@@ -554,6 +572,76 @@ class Lc0exCudaBackend final : public Backend {
   }
 
   BackendAttributes GetAttributes() const override { return attributes_; }
+
+  std::size_t MaxBatch() const { return programs_.back().batch_size; }
+  bool HasMlhOutput() const { return programs_.front().output_mlh != nullptr; }
+  // 40baf4c5 has no error output (the error-head commit is not in this base; D4 = off).
+  bool HasErrOutput() const { return false; }
+
+  // One batch of encoded positions (n <= MaxBatch()), outputs raw: policy and
+  // WDL logits, moves left, error. The middle of
+  // Lc0exCudaBackendComputation::ComputeBlocking, for the Network path.
+  void EvaluatePlanes(const std::uint64_t* masks_in, const float* values_in,
+                      std::size_t n, float* policy, float* wdl, float* mlh,
+                      float* err) {
+    LCTRACE_FUNCTION_SCOPE;
+    const auto split = FindSplit(n);
+    const ProgramSpec& program = split ? *split->first : FindProgram(n);
+    const std::size_t padded =
+        split ? split->first_count + split->second->batch_size
+              : program.batch_size;
+    // Padding slots hold copies of the last position (see ComputeBlocking).
+    std::vector<std::uint64_t> masks(padded * kInputPlanes);
+    std::vector<float> values(padded * kInputPlanes);
+    for (std::size_t sample = 0; sample < padded; ++sample) {
+      const std::size_t from = std::min(sample, n - 1) * kInputPlanes;
+      std::copy_n(masks_in + from, kInputPlanes,
+                  masks.begin() + sample * kInputPlanes);
+      std::copy_n(values_in + from, kInputPlanes,
+                  values.begin() + sample * kInputPlanes);
+    }
+    const auto mask_bytes =
+        std::as_bytes(std::span<const std::uint64_t>(masks));
+    const auto value_bytes = std::as_bytes(std::span<const float>(values));
+
+    ExecutionPermit permit(execution_semaphore_, &execution_slot_pool_);
+    const auto part = [&](const ProgramSpec& spec, std::size_t offset,
+                          std::size_t count) {
+      lc0ex::Execution& execution = GetExecution(permit.index(), spec);
+      execution.GetBuffer(*spec.input_masks)
+          .CopyFromHostAsync(
+              mask_bytes.subspan(offset * kInputPlanes * sizeof(std::uint64_t)),
+              spec.batch_size * kInputPlanes * sizeof(std::uint64_t));
+      execution.GetBuffer(*spec.input_values)
+          .CopyFromHostAsync(
+              value_bytes.subspan(offset * kInputPlanes * sizeof(float)),
+              spec.batch_size * kInputPlanes * sizeof(float));
+      execution.Run();
+      execution.GetBuffer(*spec.output_policy)
+          .CopyToHostAsync(std::as_writable_bytes(std::span<float>(
+                               policy + offset * kNumOutputPolicy,
+                               count * kNumOutputPolicy)),
+                           count * kNumOutputPolicy * sizeof(float));
+      execution.GetBuffer(*spec.output_wdl)
+          .CopyToHostAsync(std::as_writable_bytes(std::span<float>(
+                               wdl + offset * kNumWdlOutputs,
+                               count * kNumWdlOutputs)),
+                           count * kNumWdlOutputs * sizeof(float));
+      if (spec.output_mlh && mlh) {
+        execution.GetBuffer(*spec.output_mlh)
+            .CopyToHostAsync(std::as_writable_bytes(
+                                 std::span<float>(mlh + offset, count)),
+                             count * sizeof(float));
+      }
+      execution.Synchronize();
+    };
+    if (split) {
+      part(*split->first, 0, split->first_count);
+      part(*split->second, split->first_count, n - split->first_count);
+    } else {
+      part(program, 0, n);
+    }
+  }
 
   std::unique_ptr<BackendComputation> CreateComputation() override {
     return std::make_unique<Lc0exCudaBackendComputation>(this);
@@ -945,6 +1033,122 @@ class Lc0exCudaBackendFactory final : public BackendFactory {
 };
 
 REGISTER_BACKEND(Lc0exCudaBackendFactory)
+
+// lc0ex under the old Network interface, so Menkib's demux can carry it.
+class Lc0exCudaNetwork;
+
+class Lc0exCudaNetworkComputation final : public NetworkComputation {
+ public:
+  explicit Lc0exCudaNetworkComputation(Lc0exCudaBackend* backend)
+      : backend_(backend) {}
+
+  void AddInput(InputPlanes&& input) override {
+    if (input.size() != kInputPlanes) {
+      throw Exception("lc0ex-cuda-net: unexpected input plane count.");
+    }
+    for (const auto& plane : input) {
+      masks_.push_back(plane.mask);
+      values_.push_back(plane.value);
+    }
+    ++batch_;
+  }
+
+  void ComputeBlocking() override {
+    LCTRACE_FUNCTION_SCOPE;
+    if (batch_ == 0) return;
+    policy_.resize(batch_ * kNumOutputPolicy);
+    std::vector<float> wdl(batch_ * kNumWdlOutputs);
+    if (backend_->HasMlhOutput()) mlh_.resize(batch_);
+    if (backend_->HasErrOutput()) err_.resize(batch_);
+    const std::size_t top = backend_->MaxBatch();
+    for (std::size_t start = 0; start < batch_; start += top) {
+      const std::size_t n = std::min(top, batch_ - start);
+      backend_->EvaluatePlanes(
+          masks_.data() + start * kInputPlanes,
+          values_.data() + start * kInputPlanes, n,
+          policy_.data() + start * kNumOutputPolicy,
+          wdl.data() + start * kNumWdlOutputs,
+          mlh_.empty() ? nullptr : mlh_.data() + start,
+          err_.empty() ? nullptr : err_.data() + start);
+    }
+    q_.resize(batch_);
+    d_.resize(batch_);
+    for (std::size_t sample = 0; sample < batch_; ++sample) {
+      const float* logits = wdl.data() + sample * kNumWdlOutputs;
+      const float maximum = std::max({logits[0], logits[1], logits[2]});
+      const float win = std::exp(logits[0] - maximum);
+      const float draw = std::exp(logits[1] - maximum);
+      const float loss = std::exp(logits[2] - maximum);
+      const float scale = 1.0f / (win + draw + loss);
+      q_[sample] = (win - loss) * scale;
+      d_[sample] = draw * scale;
+    }
+  }
+
+  int GetBatchSize() const override { return static_cast<int>(batch_); }
+  float GetQVal(int sample) const override { return q_[sample]; }
+  float GetDVal(int sample) const override { return d_[sample]; }
+  float GetEVal(int sample) const override {
+    return err_.empty() ? 0.0f : err_[sample];
+  }
+  float GetPVal(int sample, int move_id) const override {
+    return policy_[sample * kNumOutputPolicy + move_id];
+  }
+  float GetMVal(int sample) const override {
+    return mlh_.empty() ? 0.0f : mlh_[sample];
+  }
+
+ private:
+  Lc0exCudaBackend* backend_;
+  std::size_t batch_ = 0;
+  std::vector<std::uint64_t> masks_;
+  std::vector<float> values_;
+  std::vector<float> policy_;
+  std::vector<float> q_;
+  std::vector<float> d_;
+  std::vector<float> mlh_;
+  std::vector<float> err_;
+};
+
+class Lc0exCudaNetwork final : public Network {
+ public:
+  Lc0exCudaNetwork(const WeightsFile& weights, const OptionsDict& options)
+      : backend_(weights, options, Lc0exCudaBackend::NetworkPath{}),
+        capabilities_{weights.format().network_format().input(),
+                      weights.format().network_format().output(),
+                      weights.format().network_format().moves_left()},
+        threads_(std::max(1, options.GetOrDefault<int>("concurrency", 1))),
+        batch_step_(std::max(1, options.GetOrDefault<int>("batch_step", 8))) {}
+
+  const NetworkCapabilities& GetCapabilities() const override {
+    return capabilities_;
+  }
+  std::unique_ptr<NetworkComputation> NewComputation() override {
+    return std::make_unique<Lc0exCudaNetworkComputation>(&backend_);
+  }
+  // One per execution slot; demux adds one more worker for a GPU child.
+  int GetThreads() const override { return threads_; }
+  int GetMiniBatchSize() const override {
+    return static_cast<int>(backend_.MaxBatch());
+  }
+  int GetPreferredBatchStep() const override { return batch_step_; }
+
+ private:
+  Lc0exCudaBackend backend_;
+  NetworkCapabilities capabilities_;
+  int threads_;
+  int batch_step_;
+};
+
+std::unique_ptr<Network> MakeLc0exCudaNetwork(
+    const std::optional<WeightsFile>& weights, const OptionsDict& options) {
+  if (!weights) {
+    throw Exception("The lc0ex-cuda-net backend requires a network file.");
+  }
+  return std::make_unique<Lc0exCudaNetwork>(*weights, options);
+}
+
+REGISTER_NETWORK("lc0ex-cuda-net", MakeLc0exCudaNetwork, -900)
 
 }  // namespace
 }  // namespace lczero
