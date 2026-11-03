@@ -247,7 +247,7 @@ option('lc0',
 
 option('lc0ex-runtime',
        type: 'boolean',
-       value: false,
+       value: true,
        description: 'Build the lc0ex executable runtime')
 
 option('rescorer',
