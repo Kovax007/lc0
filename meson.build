@@ -128,7 +128,17 @@ if get_option('lc0ex-runtime')
   files += gen.process('proto/lc0ex_metadata.proto',
     preserve_path_from : meson.current_source_dir())
 
-  cu_driver = cc.find_library('cuda', required: true)
+  # libcuda.so (unversioned) comes with the driver's development files; a box
+  # (or container) without them links against the toolkit's stub, and the
+  # binary then loads the driver's libcuda.so.1 at run time.
+  cu_driver = cc.find_library('cuda', required: false)
+  if not cu_driver.found()
+    cu_stub_dirs = []
+    foreach d : get_option('cudnn_libdirs')
+      cu_stub_dirs += [d, d / 'stubs']
+    endforeach
+    cu_driver = cc.find_library('cuda', dirs: cu_stub_dirs, required: true)
+  endif
   deps += cu_driver
 
   foreach d : get_option('cudnn_include')
@@ -139,6 +149,7 @@ if get_option('lc0ex-runtime')
 
   files += 'src/neural/backends/lc0ex-cuda/runtime/lc0ex_cuda.cc'
   files += 'src/neural/backends/lc0ex-cuda/network_fingerprint.cc'
+  files += 'src/neural/backends/lc0ex-cuda/bt6_native_buffers.cc'
   files += 'src/neural/backends/lc0ex-cuda/network_lc0ex_cuda.cc'
   has_backends = true
 endif

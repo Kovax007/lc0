@@ -36,5 +36,12 @@ namespace lc0ex {
 // The input is expected to have undergone LC0's usual network normalization.
 pblczero::Net BuildNetworkFingerprint(const pblczero::Net& network);
 
+// The fingerprint a native BT6 net's lab carrier has: the carrier's stub
+// format (NETWORK_ATTENTIONBODY_WITH_MULTIHEADFORMAT, the default FFN
+// activation, no encoder layers). The lc0ex programs built from a BT6 carrier
+// carry it, and they run the native file too: the buffers it fills are checked
+// one by one against the program's (type, shape, size).
+pblczero::Net BuildBt6CarrierFingerprint(const pblczero::Net& network);
+
 }  // namespace lc0ex
 }  // namespace lczero

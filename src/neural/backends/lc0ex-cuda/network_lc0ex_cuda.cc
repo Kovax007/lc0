@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -56,6 +57,7 @@
 #include "neural/onnx/converter.h"
 #include "neural/register.h"
 #include "neural/shared_params.h"
+#include "bt6_native_buffers.h"
 #include "network_fingerprint.h"
 #include "proto/lc0ex_metadata.pb.h"
 #include "runtime/lc0ex_cuda.h"
@@ -169,17 +171,112 @@ pblczero::NeuralExecutable LoadExecutableFile(const std::string& path) {
   return executable;
 }
 
+// "sm_80" -> 80, "sm_120a" -> 120; -1 when the name has no sm_ number.
+int ArchitectureNumber(std::string_view architecture) {
+  if (architecture.substr(0, 3) != "sm_") return -1;
+  int number = 0;
+  const auto* first = architecture.data() + 3;
+  const auto* last = architecture.data() + architecture.size();
+  const auto [end, error] = std::from_chars(first, last, number);
+  if (error != std::errc() || end == first) return -1;
+  return number;
+}
+
+std::string CudaVersionName(std::uint32_t version) {
+  if (version == 0) return "CUDA ?";
+  return "CUDA " + std::to_string(version / 1000) + "." +
+         std::to_string(version % 1000 / 10);
+}
+
+std::string DescribeProgram(const pblczero::Lc0exProgram& program) {
+  std::string description = std::string(program.architecture()) + " " +
+                            std::string(program.precision()) + " " +
+                            CudaVersionName(program.cuda_version());
+  if (program.has_graph()) {
+    description += ", graph " + std::string(program.graph());
+  }
+  return description;
+}
+
+// With no lc0ex= path, the program comes from the net file
+// (Net.lc0ex_programs): the one built for this GPU's architecture, of the
+// requested precision, for a CUDA major version the driver runs; among
+// several, the newest CUDA. precision=auto takes int8 when the value head is
+// winner (int8 programs serve only that head) and FP16 otherwise. The chosen
+// entry's recommended batch size and graph mode (empty when unset) are
+// returned through the last two arguments.
+pblczero::NeuralExecutable SelectCarriedProgram(
+    const WeightsFile& weights, int gpu, const std::string& precision,
+    const std::string& value_head, int* recommended_batch_size,
+    std::string* graph_mode) {
+  if (precision != "auto" && precision != "int8" && precision != "fp16") {
+    throw Exception("Unknown lc0ex precision '" + precision +
+                    "'; expected auto, int8 or fp16.");
+  }
+  if (weights.lc0ex_programs_size() == 0) {
+    throw Exception(
+        "The lc0ex-cuda backend needs a program: pass lc0ex=<file> in "
+        "--backend-opts, or use a net file that carries lc0ex programs.");
+  }
+  const std::string device = lc0ex::DeviceArchitecture(gpu);
+  const int device_number = ArchitectureNumber(device);
+  const int driver = lc0ex::DriverVersion();
+  const std::string wanted =
+      precision != "auto" ? precision
+                          : (value_head == "winner" ? "int8" : "fp16");
+
+  const pblczero::Lc0exProgram* best = nullptr;
+  for (const auto& program : weights.lc0ex_programs()) {
+    if (ArchitectureNumber(program.architecture()) != device_number) continue;
+    if (program.precision() != wanted) continue;
+    if (program.cuda_version() / 1000 > static_cast<std::uint32_t>(driver) / 1000) {
+      continue;
+    }
+    if (!best || program.cuda_version() > best->cuda_version()) best = &program;
+  }
+  if (!best) {
+    std::string carried;
+    for (const auto& program : weights.lc0ex_programs()) {
+      carried += (carried.empty() ? "" : ", ") + DescribeProgram(program);
+    }
+    throw Exception("The net file carries lc0ex programs for " + carried +
+                    "; none is " + wanted + " for this GPU (" + device +
+                    ", driver " + CudaVersionName(driver) +
+                    "). Pass lc0ex=<file> with a program built for it.");
+  }
+
+  pblczero::NeuralExecutable executable;
+  executable.ParseFromString(best->executable());
+  if (ArchitectureNumber(executable.target().architecture()) != device_number) {
+    throw Exception("The carried lc0ex program '" +
+                    std::string(best->name()) + "' is labelled " +
+                    std::string(best->architecture()) + " but targets " +
+                    std::string(executable.target().architecture()) + ".");
+  }
+  *recommended_batch_size = static_cast<int>(best->recommended_batch_size());
+  *graph_mode = best->has_graph() ? std::string(best->graph()) : "";
+  CERR << "lc0ex: using the program carried in the net file: "
+       << best->name() << " (" << DescribeProgram(*best) << "; GPU " << device
+       << ", driver " << CudaVersionName(driver) << ").";
+  return executable;
+}
+
 void CheckNetworkFingerprint(const WeightsFile& weights,
                              const pblczero::NeuralExecutable& executable) {
   pblczero::Net executable_fingerprint;
   executable_fingerprint.ParseFromString(executable.metadata());
 
-  const auto network_fingerprint = lc0ex::BuildNetworkFingerprint(weights);
-  if (network_fingerprint.OutputAsString() !=
-      executable_fingerprint.OutputAsString()) {
-    throw Exception(
-        "The lc0ex executable was created for a different network architecture.");
+  const auto expected = executable_fingerprint.OutputAsString();
+  if (lc0ex::BuildNetworkFingerprint(weights).OutputAsString() == expected) {
+    return;
   }
+  // A native BT6 file also runs the programs built from its lab carrier.
+  if (lc0ex::IsNativeBt6(weights) &&
+      lc0ex::BuildBt6CarrierFingerprint(weights).OutputAsString() == expected) {
+    return;
+  }
+  throw Exception(
+      "The lc0ex executable was created for a different network architecture.");
 }
 
 bool HasMatchingShape(const lc0ex::BufferInfo& buffer,
@@ -321,8 +418,129 @@ void CopyTensorToHostStaging(const lc0ex::BufferInfo& buffer,
       source.data(), destination_staging.data() + buffer.offset_bytes);
 }
 
+// A native BT6 file (NETWORK_ATTENTIONBODY_BT6) carries its weights as proto
+// layers, not as the program's buffers: build them (bt6_native_buffers.h) for
+// what the program serves and what the backend options select.
+//   value_head=winner|q|st       the served value head (default winner)
+//   error_head=st                the head behind /value_error/ (programs with
+//                                an error output; default st)
+//   policy_<head>=<weight>, ...  the served policy: the geometric blend of the
+//                                named heads, e.g. policy_grill=0.4315,
+//                                policy_optimistic_st=0.5685
+//   policy_head=<head>           one head (default vanilla), if no
+//                                policy_<head> weights are given
+// The blend's width is the program's (/policy/Q/w); int8 is served when the
+// program has int8 sites, from the file's int8 recipe.
+lc0ex::Bt6ServeOptions MakeBt6ServeOptions(const WeightsFile& weights,
+                                           const lc0ex::Executable& executable,
+                                           const OptionsDict& backend_options) {
+  lc0ex::Bt6ServeOptions serve;
+  serve.value_head =
+      backend_options.GetOrDefault<std::string>("value_head", "winner");
+  // Read even when the program has no error output, so a config that names it
+  // works with every program.
+  serve.error_head =
+      backend_options.GetOrDefault<std::string>("error_head", "st");
+  serve.policy.clear();
+  for (const auto& head : lc0ex::Bt6PolicyHeadNames(weights)) {
+    const std::string key = "policy_" + head;
+    double weight = 0.0;
+    if (backend_options.Exists<float>(key)) {
+      weight = lc0ex::DecimalOfFloat(backend_options.Get<float>(key));
+    } else if (backend_options.Exists<int>(key)) {
+      weight = backend_options.Get<int>(key);
+    } else {
+      continue;
+    }
+    if (weight != 0.0) serve.policy.emplace_back(head, weight);
+  }
+  if (backend_options.Exists<std::string>("policy_head")) {
+    if (!serve.policy.empty()) {
+      throw Exception(
+          "Give either policy_head or policy_<head> weights, not both.");
+    }
+    serve.policy = {{backend_options.Get<std::string>("policy_head"), 1.0}};
+  } else if (serve.policy.empty()) {
+    serve.policy = {{"vanilla", 1.0}};
+  }
+  const auto* policy_q = executable.FindBuffer("/policy/Q/w");
+  if (!policy_q || policy_q->shape.size() != 2) {
+    throw Exception("The lc0ex program has no /policy/Q/w [D, D] buffer.");
+  }
+  serve.policy_width = policy_q->shape[1];
+  serve.int8 = executable.FindBuffer("/encoder0/mha/qkv/i8/w") != nullptr;
+  serve.error = executable.FindBuffer("/value_error/embedding/w") != nullptr;
+  return serve;
+}
+
+void UploadNativeBt6Weights(const WeightsFile& weights,
+                            lc0ex::Executable& executable,
+                            const OptionsDict& backend_options) {
+  const auto serve = MakeBt6ServeOptions(weights, executable, backend_options);
+  std::string policy;
+  for (const auto& [head, weight] : serve.policy) {
+    // The weight as typed: the shortest decimal of its float.
+    std::array<char, 32> text{};
+    const auto end = std::to_chars(text.data(), text.data() + text.size(),
+                                   static_cast<float>(weight))
+                         .ptr;
+    policy += (policy.empty() ? "" : " + ") + std::string(text.data(), end) +
+              " " + head;
+  }
+  CERR << "Building the lc0ex buffers from the native BT6 weights: value head "
+       << serve.value_head << ", policy " << policy << " (width "
+       << serve.policy_width << "), " << (serve.int8 ? "int8" : "FP16")
+       << (serve.error ? ", error head " + serve.error_head : "") << ".";
+  auto buffers = lc0ex::BuildBt6Buffers(weights, serve);
+
+  std::vector<std::byte> staging(executable.GetPersistentAllocationSize(),
+                                 std::byte{0});
+  for (const auto& buffer : executable.GetBuffers()) {
+    const auto it = buffers.find(buffer.name);
+    if (it == buffers.end()) {
+      throw Exception("The lc0ex buffer '" + buffer.name +
+                      "' has no counterpart in the native BT6 weights.");
+    }
+    const auto& built = it->second;
+    if (static_cast<int>(buffer.data_type) != built.data_type) {
+      throw Exception("Data type mismatch for lc0ex buffer '" + buffer.name +
+                      "'.");
+    }
+    if (built.shape != buffer.shape) {
+      throw Exception("Shape mismatch for lc0ex buffer '" + buffer.name +
+                      "'.");
+    }
+    if (built.bytes.size() != buffer.size_bytes) {
+      throw Exception("Size mismatch for lc0ex buffer '" + buffer.name +
+                      "'.");
+    }
+    CopyTensorToHostStaging(buffer, built.bytes, staging);
+    buffers.erase(it);
+  }
+  // The builder writes every form a BT6 program may read (FP16 and int8 GEMM
+  // weights, raw and folded coefficients), so a program leaves some unread:
+  // one line, not a warning per buffer.
+  if (!buffers.empty()) {
+    std::vector<std::string> unread;
+    for (const auto& [name, built] : buffers) unread.push_back(name);
+    std::sort(unread.begin(), unread.end());
+    std::string sample;
+    for (std::size_t i = 0; i < unread.size() && i < 3; ++i) {
+      sample += (i ? ", " : "") + unread[i];
+    }
+    CERR << unread.size()
+         << " native BT6 buffers are not read by this program (expected; "
+         << sample << (unread.size() > 3 ? ", ..." : "") << ").";
+  }
+  executable.CopyPersistentFromHost(staging);
+}
+
 void UploadWeights(const WeightsFile& weights, lc0ex::Executable& executable,
                    const OptionsDict& backend_options) {
+  if (lc0ex::IsNativeBt6(weights)) {
+    UploadNativeBt6Weights(weights, executable, backend_options);
+    return;
+  }
   std::optional<WeightsFile> converted_weights;
   if (!weights.has_onnx_model()) {
     CERR << "Converting weights to ONNX first.";
@@ -540,24 +758,43 @@ class Lc0exCudaBackend final : public Backend {
     execution_slot_pool_.in_use.assign(concurrency, false);
     executions_.resize(concurrency);
 
-    const std::string lc0ex_path = backend_options.Get<std::string>("lc0ex");
-    if (lc0ex_path.empty()) {
-      throw Exception("The lc0ex-cuda backend requires an lc0ex path.");
-    }
-
-    const auto executable_proto = LoadExecutableFile(lc0ex_path);
+    const int gpu = backend_options.GetOrDefault<int>("gpu", 0);
+    const std::string lc0ex_path =
+        backend_options.GetOrDefault<std::string>("lc0ex", "");
+    const std::string precision =
+        backend_options.GetOrDefault<std::string>("precision", "auto");
+    int carried_recommended_batch_size = 0;
+    std::string carried_graph_mode;
+    const auto executable_proto =
+        !lc0ex_path.empty()
+            ? LoadExecutableFile(lc0ex_path)
+            : SelectCarriedProgram(
+                  weights, gpu, precision,
+                  backend_options.GetOrDefault<std::string>("value_head",
+                                                            "winner"),
+                  &carried_recommended_batch_size, &carried_graph_mode);
     CheckNetworkFingerprint(weights, executable_proto);
 
     // Off by default: it is a strict win only above the ladder's dense band,
     // which a search at --minibatch-size equal to the top dense rung never
     // reaches. Worth turning on for a minibatch-128 configuration.
     split_programs_ = backend_options.GetOrDefault<bool>("split_programs", false);
-    const int gpu = backend_options.GetOrDefault<int>("gpu", 0);
-    runtime_ = lc0ex::CreateLc0exCudaRuntime(
-        gpu, ResolveGraphMode(
-                 backend_options.GetOrDefault<std::string>("graph", "auto")));
+    // A carried program may name the graph mode it must run in; an explicit
+    // graph= backend option still wins.
+    std::string graph_mode =
+        backend_options.GetOrDefault<std::string>("graph", "auto");
+    if (graph_mode == "auto" && !carried_graph_mode.empty()) {
+      graph_mode = carried_graph_mode;
+    }
+    runtime_ = lc0ex::CreateLc0exCudaRuntime(gpu, ResolveGraphMode(graph_mode));
     executable_ = runtime_->Load(executable_proto);
     InitializePrograms();
+    // A carried program may name the batch size a search should use when
+    // --minibatch-size=0 (the default); never above the largest it serves.
+    if (carried_recommended_batch_size > 0 &&
+        carried_recommended_batch_size < attributes_.maximum_batch_size) {
+      attributes_.recommended_batch_size = carried_recommended_batch_size;
+    }
     UploadWeights(weights, *executable_, backend_options);
   }
 

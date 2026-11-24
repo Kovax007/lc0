@@ -1214,5 +1214,24 @@ std::unique_ptr<Runtime> CreateLc0exCudaRuntime(int device_ordinal,
   return std::make_unique<Lc0exCudaRuntime>(device_ordinal, graph_mode);
 }
 
+std::string DeviceArchitecture(int device_ordinal) {
+  LC0EX_CUDA_CHECK(cuInit(0));
+  CUdevice device = 0;
+  LC0EX_CUDA_CHECK(cuDeviceGet(&device, device_ordinal));
+  int major = 0;
+  int minor = 0;
+  LC0EX_CUDA_CHECK(cuDeviceGetAttribute(
+      &major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device));
+  LC0EX_CUDA_CHECK(cuDeviceGetAttribute(
+      &minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device));
+  return "sm_" + std::to_string(major * 10 + minor);
+}
+
+int DriverVersion() {
+  int version = 0;
+  LC0EX_CUDA_CHECK(cuDriverGetVersion(&version));
+  return version;
+}
+
 }  // namespace lc0ex
 }  // namespace lczero

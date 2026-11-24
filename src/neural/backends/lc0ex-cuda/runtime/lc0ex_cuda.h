@@ -45,5 +45,12 @@ enum class GraphMode { kOff, kDag, kLinear };
 std::unique_ptr<Runtime> CreateLc0exCudaRuntime(
     int device_ordinal = 0, GraphMode graph_mode = GraphMode::kDag);
 
+// The device's architecture as a program's target names it, e.g. "sm_80".
+std::string DeviceArchitecture(int device_ordinal);
+
+// The CUDA version the installed driver supports, counted as the driver API
+// counts it (12050 = 12.5).
+int DriverVersion();
+
 }  // namespace lc0ex
 }  // namespace lczero

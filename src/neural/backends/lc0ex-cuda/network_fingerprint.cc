@@ -176,5 +176,21 @@ pblczero::Net BuildNetworkFingerprint(const pblczero::Net& network) {
   return fingerprint;
 }
 
+pblczero::Net BuildBt6CarrierFingerprint(const pblczero::Net& network) {
+  const auto& source = network.format().network_format();
+  pblczero::Net carrier;
+  auto* format = carrier.mutable_format()->mutable_network_format();
+  format->set_input(source.input());
+  format->set_output(source.output());
+  format->set_network(NetworkFormat::NETWORK_ATTENTIONBODY_WITH_MULTIHEADFORMAT);
+  format->set_policy(source.policy());
+  format->set_value(source.value());
+  format->set_moves_left(source.moves_left());
+  format->set_input_embedding(source.input_embedding());
+  format->set_default_activation(source.default_activation());
+  format->set_smolgen_activation(source.smolgen_activation());
+  return BuildNetworkFingerprint(carrier);
+}
+
 }  // namespace lc0ex
 }  // namespace lczero
