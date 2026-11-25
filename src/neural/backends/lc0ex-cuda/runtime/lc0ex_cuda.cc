@@ -35,6 +35,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -119,6 +120,28 @@ std::vector<std::int64_t> DefaultStrides(
     strides[i - 1] = strides[i] * static_cast<std::int64_t>(shape[i]);
   }
   return strides;
+}
+
+// Number of bytes spanned by a tensor with the given strides, i.e. one past
+// the last byte of its last element. Returns nullopt on negative strides or
+// overflow. (From upstream PR 2496, runtime/layout.h.)
+std::optional<std::uint64_t> StridedExtentBytes(
+    const std::vector<std::uint64_t>& shape,
+    const std::vector<std::int64_t>& strides, std::size_t elem_size) {
+  if (strides.size() != shape.size()) return std::nullopt;
+  constexpr auto kMax = std::numeric_limits<std::uint64_t>::max();
+  std::uint64_t last_element = 0;
+  for (std::size_t i = 0; i < shape.size(); ++i) {
+    if (shape[i] == 0) return 0;
+    if (strides[i] < 0) return std::nullopt;
+    const auto stride = static_cast<std::uint64_t>(strides[i]);
+    if (stride != 0 && shape[i] - 1 > kMax / stride) return std::nullopt;
+    const std::uint64_t span = (shape[i] - 1) * stride;
+    if (last_element > kMax - span) return std::nullopt;
+    last_element += span;
+  }
+  if (last_element > kMax / elem_size - 1) return std::nullopt;
+  return (last_element + 1) * elem_size;
 }
 
 BufferInfo MakeBufferInfo(const pblczero::Buffer& buffer) {
@@ -241,10 +264,13 @@ void CopyStridedDtoH(const std::vector<std::uint64_t>& shape,
 
 std::array<unsigned int, 3> LaunchDimensions(
     const std::vector<std::uint32_t>& dimensions) {
-  std::array<unsigned int, 3> result = {1, 1, 1};
-  for (std::size_t i = 0; i < dimensions.size(); ++i) {
-    result[i] = dimensions[i];
+  if (dimensions.empty() || dimensions.size() > 3 ||
+      absl::c_linear_search(dimensions, 0u)) {
+    throw Exception(
+        "lc0ex launch dimensions must contain one to three nonzero values.");
   }
+  std::array<unsigned int, 3> result = {1, 1, 1};
+  absl::c_copy(dimensions, result.begin());
   return result;
 }
 
@@ -934,6 +960,150 @@ std::unique_ptr<Execution> Lc0exCudaExecutable::CreateExecution(
   return execution;
 }
 
+// Checks the references and invariants of an executable that the builders
+// below rely on, so that malformed files produce an error instead of
+// out-of-bounds accesses. (From upstream PR 2496, review fixes of 11-07.)
+class ExecutableValidator {
+ public:
+  explicit ExecutableValidator(const pblczero::NeuralExecutable& source)
+      : source_(source) {}
+
+  void Validate() {
+    for (const auto& binary : source_.binaries()) {
+      Check(binary.format() == pblczero::Binary::FORMAT_CUBIN,
+            "unsupported binary format");
+    }
+    std::uint64_t persistent_size = 0;
+    if (source_.has_persistent_allocation()) {
+      ValidateAllocation(source_.persistent_allocation());
+      persistent_size = source_.persistent_allocation().size_bytes();
+    }
+    for (const auto& parameter : source_.parameters()) {
+      Check(
+          parameter.type() == pblczero::ParameterType_PARAMETER_TYPE_U32 ||
+              parameter.type() ==
+                  pblczero::ParameterType_PARAMETER_TYPE_POINTER,
+          "invalid type of parameter '" + std::string(parameter.name()) + "'");
+      Check(parameter_types_
+                .emplace(std::string(parameter.name()), parameter.type())
+                .second,
+            "duplicate parameter '" + std::string(parameter.name()) + "'");
+    }
+    for (const auto& buffer : source_.buffers()) {
+      ValidateBuffer(buffer, persistent_size);
+    }
+    for (const auto& kernel : source_.kernels()) {
+      Check(kernel.binary_idx() < source_.binaries_size(),
+            "kernel '" + std::string(kernel.function()) +
+                "' refers to a missing binary");
+      for (const auto type : kernel.parameters()) {
+        Check(type != pblczero::ParameterType_PARAMETER_TYPE_UNKNOWN,
+              "kernel '" + std::string(kernel.function()) +
+                  "' has an unknown parameter type");
+      }
+    }
+    for (const auto& program : source_.programs()) ValidateProgram(program);
+  }
+
+ private:
+  void Check(bool condition, const std::string& message) const {
+    if (!condition)
+      throw Exception("Invalid lc0ex executable: " + message + ".");
+  }
+
+  void ValidateAllocation(const pblczero::Allocation& allocation) const {
+    const auto alignment = allocation.alignment_bytes();
+    Check(alignment != 0 && (alignment & (alignment - 1)) == 0,
+          "allocation alignment must be a nonzero power of two");
+  }
+
+  void ValidateBuffer(const pblczero::Buffer& buffer,
+                      std::uint64_t allocation_size) const {
+    const std::string name(buffer.name());
+    const std::vector<std::uint64_t> shape(buffer.shape().begin(),
+                                           buffer.shape().end());
+    std::vector<std::int64_t> strides = DefaultStrides(shape);
+    if (buffer.has_layout() && buffer.layout().strides_size() > 0) {
+      strides.assign(buffer.layout().strides().begin(),
+                     buffer.layout().strides().end());
+    }
+    const auto extent =
+        StridedExtentBytes(shape, strides, ElementSize(buffer.data_type()));
+    Check(extent.has_value(), "buffer '" + name + "' has an invalid layout");
+    Check(buffer.offset() <= allocation_size &&
+              *extent <= allocation_size - buffer.offset(),
+          "buffer '" + name + "' exceeds its allocation");
+  }
+
+  void ValidateProgram(const pblczero::Program& program) const {
+    const std::string program_name(program.name());
+    std::uint64_t execution_size = 0;
+    if (program.has_execution_allocation()) {
+      ValidateAllocation(program.execution_allocation());
+      execution_size = program.execution_allocation().size_bytes();
+    }
+    for (const auto& buffer : program.buffers()) {
+      ValidateBuffer(buffer, execution_size);
+    }
+    for (std::size_t i = 0; i < program.nodes_size(); ++i) {
+      ValidateNode(
+          program.nodes(i), i,
+          "node " + std::to_string(i) + " of program '" + program_name + "'");
+    }
+  }
+
+  void ValidateNode(const pblczero::Node& node, std::size_t node_index,
+                    const std::string& where) const {
+    Check(node.kernel_idx() < source_.kernels_size(),
+          where + " refers to a missing kernel");
+    for (const auto dependency : node.dependencies()) {
+      Check(dependency < node_index,
+            where + " must only depend on earlier nodes");
+    }
+    std::size_t argument_index = 0;
+    for (const auto type : source_.kernels(node.kernel_idx()).parameters()) {
+      if (type == pblczero::ParameterType_PARAMETER_TYPE_NULL_POINTER) continue;
+      Check(argument_index < node.arguments_size(),
+            where + " has too few arguments");
+      ValidateArgument(node.arguments(argument_index++), type, where);
+    }
+    Check(argument_index == node.arguments_size(),
+          where + " has too many arguments");
+  }
+
+  void ValidateArgument(const pblczero::Node::Argument& argument,
+                        pblczero::ParameterType type,
+                        const std::string& where) const {
+    Check(argument.has_parameter_name() + argument.has_allocation() +
+                  argument.has_symbol() ==
+              1,
+          where + " has an argument without exactly one source");
+    if (argument.has_parameter_name()) {
+      const auto iter =
+          parameter_types_.find(std::string(argument.parameter_name()));
+      Check(iter != parameter_types_.end(),
+            where + " refers to a missing parameter");
+      Check(iter->second == type, where + " has a mistyped parameter");
+      return;
+    }
+    Check(type == pblczero::ParameterType_PARAMETER_TYPE_POINTER,
+          where + " passes a pointer to a non-pointer parameter");
+    if (argument.has_symbol()) {
+      Check(argument.symbol().binary_idx() < source_.binaries_size(),
+            where + " refers to a symbol in a missing binary");
+      return;
+    }
+    using AllocationLocation = pblczero::Node::Argument::AllocationLocation;
+    const auto kind = argument.allocation().kind();
+    Check(kind == AllocationLocation::ALLOCATION_PERSISTENT ||
+              kind == AllocationLocation::ALLOCATION_EXECUTION,
+          where + " has an unknown allocation kind");
+  }
+
+  const pblczero::NeuralExecutable& source_;
+  std::unordered_map<std::string, pblczero::ParameterType> parameter_types_;
+};
+
 void BuildModules(Lc0exCudaExecutable& executable,
                   const pblczero::NeuralExecutable& source) {
   executable.modules_.reserve(source.binaries_size());
@@ -1135,11 +1305,6 @@ void BuildProgram(Lc0exCudaExecutable& executable,
     plan.grid_ = LaunchDimensions(node.grid());
     plan.block_ = LaunchDimensions(node.block());
     plan.dynamic_shared_memory_bytes_ = node.dynamic_shared_memory_bytes();
-    if (plan.dynamic_shared_memory_bytes_ != 0) {
-      LC0EX_CUDA_CHECK(cuFuncSetAttribute(
-          plan.function_, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-          plan.dynamic_shared_memory_bytes_));
-    }
     BuildArguments(executable, *destination, node, kernel, &plan);
     plan.dependencies_.assign(node.dependencies().begin(),
                               node.dependencies().end());
@@ -1170,6 +1335,24 @@ void BuildPrograms(Lc0exCudaExecutable& executable,
   }
 }
 
+// The dynamic shared memory limit is an attribute of the CUfunction, so it is
+// set to the maximum requested by any node using that function. (From
+// upstream PR 2496; setting it per node left the last node's value.)
+void SetSharedMemoryLimits(Lc0exCudaExecutable& executable) {
+  std::unordered_map<CUfunction, unsigned int> limits;
+  for (const auto& program : executable.programs_) {
+    for (const auto& node : program.nodes_) {
+      auto& limit = limits[node.function_];
+      limit = std::max(limit, node.dynamic_shared_memory_bytes_);
+    }
+  }
+  for (const auto& [function, limit] : limits) {
+    if (limit == 0) continue;
+    LC0EX_CUDA_CHECK(cuFuncSetAttribute(
+        function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, limit));
+  }
+}
+
 class Lc0exCudaRuntime final : public Runtime {
  public:
   Lc0exCudaRuntime(int device_ordinal, GraphMode graph_mode)
@@ -1184,6 +1367,7 @@ class Lc0exCudaRuntime final : public Runtime {
     if (source.format() != kFormat) {
       throw Exception("Unsupported lc0ex format generation.");
     }
+    ExecutableValidator(source).Validate();
 
     auto executable =
         std::make_unique<Lc0exCudaExecutable>(device_, graph_mode_);
@@ -1199,6 +1383,7 @@ class Lc0exCudaRuntime final : public Runtime {
     BuildPersistentBuffers(*executable, source);
     BuildKernels(*executable, source);
     BuildPrograms(*executable, source);
+    SetSharedMemoryLimits(*executable);
     return executable;
   }
 
